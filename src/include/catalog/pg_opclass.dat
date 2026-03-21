@@ -479,13 +479,12 @@
 { opcmethod => 'brin', opcname => 'pg_lsn_bloom_ops',
   opcfamily => 'brin/pg_lsn_bloom_ops', opcintype => 'pg_lsn',
   opcdefault => 'f', opckeytype => 'pg_lsn' },
-
-# no brin opclass for enum, tsvector, tsquery, jsonb
-
 { opcmethod => 'brin', opcname => 'box_inclusion_ops',
   opcfamily => 'brin/box_inclusion_ops', opcintype => 'box',
   opckeytype => 'box' },
-
-# no brin opclass for the geometric types except box
-
+{ oid => '9100',
+  opcmethod => 'bwtree',
+  opcname => 'int4_bwtree_ops',
+  opcfamily => 'btree/integer_ops',
+  opcintype => 'int4' },
 ]
