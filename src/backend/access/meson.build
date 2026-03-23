@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 subdir('brin')
+subdir('bwtree')
 subdir('common')
 subdir('gin')
 subdir('gist')

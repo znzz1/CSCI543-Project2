@@ -1,36 +1,38 @@
+/*-------------------------------------------------------------------------
+ *
+ * bwtree.c
+ *    Public access-method entry points for the Bw-tree index.
+ *
+ *    The Bw-tree is a latch-free index structure (ICDE 2013) that uses
+ *    a mapping table, delta chains, CAS-based updates, and epoch-based
+ *    reclamation instead of the traditional latch-based B+tree approach.
+ *
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
-#include "access/amapi.h"
-#include "access/heapam.h"
-#include "access/tableam.h"
-#include "catalog/index.h"
-#include "fmgr.h"
-#include "nodes/execnodes.h"
-#include "utils/rel.h"
-
-PG_MODULE_MAGIC;
-
-PG_FUNCTION_INFO_V1(bwtreehandler);
-
-static IndexBuildResult *bwtree_build(Relation heap, Relation index,
-									  IndexInfo *indexInfo);
-static void bwtree_buildempty(Relation index);
+#include "access/bwtree.h"
+#include "access/stratnum.h"
 
 /*
- * bwtree handler
+ * Bw-tree handler function: return IndexAmRoutine with access method
+ * parameters and callbacks.
+ *
+ * Bw-tree supports ordered access (like B+tree) but is latch-free.
+ * Several features that are B+tree-specific (CLUSTER, parallel scan,
+ * INCLUDE columns) are disabled for the initial implementation.
  */
 Datum
 bwtreehandler(PG_FUNCTION_ARGS)
 {
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
-	amroutine->amstrategies = 0;
-	amroutine->amsupport = 0;
-	amroutine->amoptsprocnum = 0;
-
-	amroutine->amcanorder = false;
+	amroutine->amstrategies = BTMaxStrategyNumber;
+	amroutine->amsupport = BWTREE_NPROCS;
+	amroutine->amoptsprocnum = BWTREE_OPTIONS_PROC;
+	amroutine->amcanorder = true;
 	amroutine->amcanorderbyop = false;
-	amroutine->amcanbackward = false;
+	amroutine->amcanbackward = true;
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = true;
 	amroutine->amoptionalkey = true;
@@ -44,28 +46,27 @@ bwtreehandler(PG_FUNCTION_ARGS)
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = false;
 	amroutine->amsummarizing = false;
-	amroutine->amparallelvacuumoptions = 0;
-
+	amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
 	amroutine->amkeytype = InvalidOid;
 
-	amroutine->ambuild = bwtree_build;
-	amroutine->ambuildempty = bwtree_buildempty;
-	amroutine->aminsert = NULL;
+	amroutine->ambuild = bwtreebuild;
+	amroutine->ambuildempty = bwtreebuildempty;
+	amroutine->aminsert = bwtreeinsert;
 	amroutine->aminsertcleanup = NULL;
-	amroutine->ambulkdelete = NULL;
-	amroutine->amvacuumcleanup = NULL;
+	amroutine->ambulkdelete = bwtreebulkdelete;
+	amroutine->amvacuumcleanup = bwtreevacuumcleanup;
 	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = NULL;
-	amroutine->amoptions = NULL;
+	amroutine->amcostestimate = bwtreecostestimate;
+	amroutine->amoptions = bwtreeoptions;
 	amroutine->amproperty = NULL;
-	amroutine->ambuildphasename = NULL;
-	amroutine->amvalidate = NULL;
-	amroutine->amadjustmembers = NULL;
-	amroutine->ambeginscan = NULL;
-	amroutine->amrescan = NULL;
-	amroutine->amgettuple = NULL;
-	amroutine->amgetbitmap = NULL;
-	amroutine->amendscan = NULL;
+	amroutine->ambuildphasename = bwtreebuildphasename;
+	amroutine->amvalidate = bwtreevalidate;
+	amroutine->amadjustmembers = bwtreeadjustmembers;
+	amroutine->ambeginscan = bwtreebeginscan;
+	amroutine->amrescan = bwtreerescan;
+	amroutine->amgettuple = bwtreegettuple;
+	amroutine->amgetbitmap = bwtreegetbitmap;
+	amroutine->amendscan = bwtreeendscan;
 	amroutine->ammarkpos = NULL;
 	amroutine->amrestrpos = NULL;
 	amroutine->amestimateparallelscan = NULL;
@@ -75,31 +76,23 @@ bwtreehandler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(amroutine);
 }
 
-/*
- * bwtree_build
- * 最小实现：先不扫描 heap，不插任何 tuple
- */
-static IndexBuildResult *
-bwtree_build(Relation heap, Relation index, IndexInfo *indexInfo)
+IndexBulkDeleteResult *
+bwtreebulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+				 IndexBulkDeleteCallback callback, void *callback_state)
 {
-	IndexBuildResult *result;
+	(void) info;
+	(void) callback;
+	(void) callback_state;
 
-	if (RelationGetNumberOfBlocks(index) != 0)
-		elog(ERROR, "index \"%s\" already contains data",
-			 RelationGetRelationName(index));
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
-	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
-	result->heap_tuples = 0;
-	result->index_tuples = 0;
-
-	return result;
+	return stats;
 }
 
-/*
- * bwtree_buildempty
- * 当前先不做初始化页
- */
-static void
-bwtree_buildempty(Relation index)
+IndexBulkDeleteResult *
+bwtreevacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
+	(void) info;
+	return stats;
 }
