@@ -156,11 +156,29 @@ typedef struct BWTreeMappingTable
  *
  *  Threads enter/leave epochs.  Pointers retired during epoch E can
  *  only be freed once no thread is still in epoch <= E.
+ *
+ *  In PostgreSQL each backend is a single-threaded process.  The
+ *  epoch mechanism still matters because an ongoing index scan may
+ *  hold a reference to a node that is being replaced by a concurrent
+ *  consolidation or SMO in the same transaction.
  * ---------------------------------------------------------------- */
+
+typedef struct BWTreeRetiredEntry
+{
+	void       *ptr;               /* palloc'd object to be freed */
+	uint64      retired_epoch;     /* epoch at which this was retired */
+	struct BWTreeRetiredEntry *next;
+} BWTreeRetiredEntry;
+
 typedef struct BWTreeEpochManager
 {
-	uint64  global_epoch;
-	uint64  min_active_epoch;
+	uint64  global_epoch;          /* monotonically increasing counter */
+	uint64  local_epoch;           /* epoch this backend entered (0 = none) */
+	bool    in_epoch;              /* true between enter() and leave() */
+	int     nesting;               /* allow nested enter/leave pairs */
+
+	BWTreeRetiredEntry *retired_head;  /* singly-linked list */
+	int     retired_count;
 } BWTreeEpochManager;
 
 /* ----------------------------------------------------------------
