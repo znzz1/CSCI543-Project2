@@ -3227,4 +3227,21 @@
   amoprighttype => 'point', amopstrategy => '7', amopopr => '@>(box,point)',
   amopmethod => 'brin' },
 
+# bwtree int4 operators
+{ amopfamily => 'bwtree/integer_ops', amoplefttype => 'int4',
+  amoprighttype => 'int4', amopstrategy => '1', amopopr => '<(int4,int4)',
+  amopmethod => 'bwtree' },
+{ amopfamily => 'bwtree/integer_ops', amoplefttype => 'int4',
+  amoprighttype => 'int4', amopstrategy => '2', amopopr => '<=(int4,int4)',
+  amopmethod => 'bwtree' },
+{ amopfamily => 'bwtree/integer_ops', amoplefttype => 'int4',
+  amoprighttype => 'int4', amopstrategy => '3', amopopr => '=(int4,int4)',
+  amopmethod => 'bwtree' },
+{ amopfamily => 'bwtree/integer_ops', amoplefttype => 'int4',
+  amoprighttype => 'int4', amopstrategy => '4', amopopr => '>=(int4,int4)',
+  amopmethod => 'bwtree' },
+{ amopfamily => 'bwtree/integer_ops', amoplefttype => 'int4',
+  amoprighttype => 'int4', amopstrategy => '5', amopopr => '>(int4,int4)',
+  amopmethod => 'bwtree' },
+
 ]

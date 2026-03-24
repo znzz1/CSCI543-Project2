@@ -1,174 +1,205 @@
 /*-------------------------------------------------------------------------
  *
  * bwtreedelta.c
- *    Delta-record operations for the Bw-tree access method.
+ *    Delta-page operations for the Bw-tree.
  *
- *    Each modification to a logical page is expressed as a delta record
- *    that is prepended to the page's delta chain.  The new chain head is
- *    installed into the mapping table via CAS.
- *
- *    Delta types (from the Bw-tree paper):
- *      - INSERT / DELETE / UPDATE  – data-level changes
- *      - SPLIT        – marks that a key range has moved to a new sibling
- *      - SEPARATOR    – index-entry delta posted to the parent after split
- *      - MERGE        – records that a sibling's content has been absorbed
- *      - REMOVE_NODE  – logically removes a page after merge
+ *    Each modification (INSERT / DELETE) is recorded as a delta record
+ *    on a delta page chain rather than modifying the base page in place.
+ *    The chain head block is stored in the mapping table.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/bwtree.h"
+#include "storage/bufmgr.h"
 
-/* ----------------------------------------------------------------
- *  bwtree_delta_create
+/*
+ * Install a delta record for the logical page identified by `pid`.
  *
- *  Allocate a zeroed delta record of the given type.
- * ---------------------------------------------------------------- */
-BWTreeDeltaRecord *
-bwtree_delta_create(BWTreeDeltaType type)
-{
-	BWTreeDeltaRecord *delta;
-
-	delta = (BWTreeDeltaRecord *) palloc0(sizeof(BWTreeDeltaRecord));
-	delta->type = type;
-	return delta;
-}
-
-/* ----------------------------------------------------------------
- *  Install helpers
- *
- *  Each "install" function builds the appropriate delta record,
- *  prepends it to the delta chain of the target PID, and atomically
- *  swaps the mapping-table pointer via CAS.
- *
- *  Returns true on CAS success, false if the caller must retry.
- * ---------------------------------------------------------------- */
-
-bool
-bwtree_delta_install_insert(BWTreeMappingTable *mt,
-							BWTreePid pid,
-							Datum key, bool key_is_null,
-							ItemPointer heap_tid)
-{
-	(void) mt;
-	(void) pid;
-	(void) key;
-	(void) key_is_null;
-	(void) heap_tid;
-
-	return false;
-}
-
-bool
-bwtree_delta_install_delete(BWTreeMappingTable *mt,
-							BWTreePid pid,
-							Datum key, bool key_is_null,
-							ItemPointer heap_tid)
-{
-	(void) mt;
-	(void) pid;
-	(void) key;
-	(void) key_is_null;
-	(void) heap_tid;
-
-	return false;
-}
-
-/*
- * Split delta: posted to the page being split.
- * Records: "keys >= split_key now live at new_sibling_pid".
- */
-bool
-bwtree_delta_install_split(BWTreeMappingTable *mt,
-						   BWTreePid pid,
-						   Datum split_key,
-						   BWTreePid new_sibling_pid)
-{
-	(void) mt;
-	(void) pid;
-	(void) split_key;
-	(void) new_sibling_pid;
-
-	return false;
-}
-
-/*
- * Separator (index-entry) delta: posted to the parent page.
- * Records: "keys >= split_key should follow pointer to new_child_pid".
- */
-bool
-bwtree_delta_install_separator(BWTreeMappingTable *mt,
-							   BWTreePid parent_pid,
-							   Datum split_key,
-							   BWTreePid new_child_pid)
-{
-	(void) mt;
-	(void) parent_pid;
-	(void) split_key;
-	(void) new_child_pid;
-
-	return false;
-}
-
-/*
- * Merge delta: posted to the page that absorbs its right sibling.
- */
-bool
-bwtree_delta_install_merge(BWTreeMappingTable *mt,
-						   BWTreePid pid,
-						   BWTreePid merged_sibling_pid)
-{
-	(void) mt;
-	(void) pid;
-	(void) merged_sibling_pid;
-
-	return false;
-}
-
-/*
- * Remove-node delta: logically removes a page after its content has
- * been merged into a neighbor.
- */
-bool
-bwtree_delta_install_remove_node(BWTreeMappingTable *mt,
-								 BWTreePid pid)
-{
-	(void) mt;
-	(void) pid;
-
-	return false;
-}
-
-/* ----------------------------------------------------------------
- *  Delta chain traversal
- * ---------------------------------------------------------------- */
-
-/*
- * Search the delta chain + base page for a specific key.
- * Returns true and fills result_tid if found.
- */
-bool
-bwtree_delta_chain_search(BWTreeNode *node, Datum key,
-						  ScanKey scankey,
-						  ItemPointer result_tid)
-{
-	(void) node;
-	(void) key;
-	(void) scankey;
-	(void) result_tid;
-
-	return false;
-}
-
-/*
- * Walk the entire delta chain and produce a consolidated base page
- * with all deltas applied in order.
+ * Steps:
+ *   1. Look up current delta_blkno from the mapping table.
+ *   2. If a delta page exists and has room, append the record there.
+ *   3. Otherwise allocate a new delta page, prepend it to the chain,
+ *      and update the mapping table.
  */
 void
-bwtree_delta_chain_collect(BWTreeNode *node,
-						   BWTreeBasePage **out_page)
+_bwt_delta_install(Relation rel, BWTreeMetaPageData *metad,
+				   BWTreePid pid, BWTreeDeltaType type,
+				   IndexTuple itup, BWTreePid related_pid)
 {
-	(void) node;
-	(void) out_page;
+	BlockNumber base_blkno;
+	BlockNumber delta_blkno;
+	Size		rec_size;
+	Size		itup_size;
+	BWTreeDeltaRecordData *rec;
+	char	   *rec_buf;
+	bool		found;
+
+	found = _bwt_map_lookup(rel, metad, pid, &base_blkno, &delta_blkno);
+	if (!found)
+		elog(ERROR, "bwtree: PID %u not found in mapping table", pid);
+
+	/* build the delta record in a temporary buffer */
+	itup_size = (itup != NULL) ? IndexTupleSize(itup) : 0;
+	rec_size = SizeOfBWTreeDeltaRecord + itup_size;
+
+	rec_buf = (char *) palloc0(rec_size);
+	rec = (BWTreeDeltaRecordData *) rec_buf;
+	rec->type = type;
+	rec->related_pid = related_pid;
+	rec->data_len = (uint16) itup_size;
+	if (itup != NULL)
+		memcpy(rec_buf + SizeOfBWTreeDeltaRecord, itup, itup_size);
+
+	/* try to add to existing head delta page */
+	if (delta_blkno != InvalidBlockNumber)
+	{
+		Buffer		dbuf;
+		Page		dpage;
+
+		dbuf = _bwt_getbuf(rel, delta_blkno, BWT_WRITE);
+		dpage = BufferGetPage(dbuf);
+
+		if (PageGetFreeSpace(dpage) >= MAXALIGN(rec_size) + sizeof(ItemIdData))
+		{
+			OffsetNumber off;
+
+			off = PageAddItem(dpage, (Item) rec_buf, rec_size,
+							  InvalidOffsetNumber, false, false);
+			if (off == InvalidOffsetNumber)
+				elog(ERROR, "bwtree: failed to add delta record to page");
+
+			MarkBufferDirty(dbuf);
+			_bwt_relbuf(rel, dbuf);
+			pfree(rec_buf);
+			return;
+		}
+
+		_bwt_relbuf(rel, dbuf);
+	}
+
+	/* need a new delta page */
+	{
+		Buffer		newbuf;
+		Page		newpage;
+		BWTreePageOpaque opaque;
+		OffsetNumber off;
+
+		newbuf = _bwt_allocbuf(rel);
+		newpage = BufferGetPage(newbuf);
+
+		_bwt_initpage(newpage, BWT_DELTA, pid, 0);
+
+		opaque = BWTreePageGetOpaque(newpage);
+		opaque->bwto_next = delta_blkno;   /* link to old chain head */
+
+		off = PageAddItem(newpage, (Item) rec_buf, rec_size,
+						  InvalidOffsetNumber, false, false);
+		if (off == InvalidOffsetNumber)
+			elog(ERROR, "bwtree: failed to add delta record to new page");
+
+		MarkBufferDirty(newbuf);
+
+		/* update mapping table: point delta_blkno to the new page */
+		_bwt_map_update(rel, metad, pid,
+						base_blkno, BufferGetBlockNumber(newbuf));
+
+		_bwt_relbuf(rel, newbuf);
+	}
+
+	pfree(rec_buf);
+}
+
+/*
+ * Apply all delta records from the delta chain onto a copy of the
+ * base page.  Returns the number of net insertions (positive) or
+ * deletions (negative) applied.
+ *
+ * The caller passes a writable page buffer (typically a palloc'd copy
+ * of the base page).  INSERT deltas add items, DELETE deltas remove
+ * matching items.
+ *
+ * Only INSERT / DELETE deltas are applied; structural deltas (SPLIT
+ * etc.) are ignored for now.
+ *
+ * `maxoff` is updated to the new maximum offset on the page.
+ */
+int
+_bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
+				 Page base_page, OffsetNumber *maxoff)
+{
+	int			net = 0;
+	BlockNumber cur_blkno = delta_blkno;
+
+	while (cur_blkno != InvalidBlockNumber)
+	{
+		Buffer		dbuf;
+		Page		dpage;
+		BWTreePageOpaque opaque;
+		OffsetNumber doff;
+		OffsetNumber dmaxoff;
+
+		dbuf = _bwt_getbuf(rel, cur_blkno, BWT_READ);
+		dpage = BufferGetPage(dbuf);
+		opaque = BWTreePageGetOpaque(dpage);
+
+		dmaxoff = PageGetMaxOffsetNumber(dpage);
+
+		for (doff = FirstOffsetNumber; doff <= dmaxoff; doff++)
+		{
+			ItemId			did = PageGetItemId(dpage, doff);
+			BWTreeDeltaRecordData *drec;
+			IndexTuple		ditup;
+
+			if (!ItemIdIsUsed(did))
+				continue;
+
+			drec = (BWTreeDeltaRecordData *) PageGetItem(dpage, did);
+			ditup = BWTreeDeltaRecordGetTuple(drec);
+
+			if (drec->type == BW_DELTA_INSERT && ditup != NULL)
+			{
+				Size itup_size = IndexTupleSize(ditup);
+
+				if (PageGetFreeSpace(base_page) >=
+					MAXALIGN(itup_size) + sizeof(ItemIdData))
+				{
+					PageAddItem(base_page, (Item) ditup, itup_size,
+								InvalidOffsetNumber, false, false);
+					net++;
+				}
+			}
+			else if (drec->type == BW_DELTA_DELETE && ditup != NULL)
+			{
+				OffsetNumber boff;
+				OffsetNumber bmaxoff = PageGetMaxOffsetNumber(base_page);
+
+				for (boff = FirstOffsetNumber; boff <= bmaxoff; boff++)
+				{
+					ItemId		bid = PageGetItemId(base_page, boff);
+					IndexTuple	bitup;
+
+					if (!ItemIdIsUsed(bid))
+						continue;
+
+					bitup = (IndexTuple) PageGetItem(base_page, bid);
+
+					if (IndexTupleSize(bitup) == IndexTupleSize(ditup) &&
+						memcmp(bitup, ditup, IndexTupleSize(ditup)) == 0)
+					{
+						PageIndexTupleDelete(base_page, boff);
+						net--;
+						break;
+					}
+				}
+			}
+		}
+
+		cur_blkno = opaque->bwto_next;
+		_bwt_relbuf(rel, dbuf);
+	}
+
+	*maxoff = PageGetMaxOffsetNumber(base_page);
+	return net;
 }

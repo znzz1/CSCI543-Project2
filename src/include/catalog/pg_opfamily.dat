@@ -305,4 +305,7 @@
 { oid => '6158',
   opfmethod => 'gist', opfname => 'multirange_ops' },
 
+{ oid => '9200',
+  opfmethod => 'bwtree', opfname => 'integer_ops' },
+
 ]

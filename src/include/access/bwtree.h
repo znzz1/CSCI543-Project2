@@ -1,20 +1,18 @@
 /*-------------------------------------------------------------------------
  *
  * bwtree.h
- *    Header file for PostgreSQL Bw-tree index access method.
+ *    Header for PostgreSQL Bw-tree index access method.
  *
- *    The Bw-tree is a latch-free B+tree variant designed for high-concurrency
- *    workloads (ICDE 2013, Microsoft Hekaton).  Its core ideas are:
+ *    The Bw-tree is a latch-free index (ICDE 2013) that stores all data
+ *    in PostgreSQL buffer pages.  Core concepts:
  *
- *      1. Mapping Table  – logical page id (PID) -> physical pointer,
- *         enabling atomic page swaps via CAS.
- *      2. Delta Chains   – modifications are prepended as delta records
- *         instead of updating pages in place.
- *      3. Consolidation  – long delta chains are periodically collapsed
- *         into a new base page.
- *      4. Structure Modification Operations (SMO) – split / merge use
- *         split-delta and separator-delta records.
- *      5. Epoch-based Reclamation – safely free obsolete pages/deltas.
+ *      1. Mapping Table  – PID -> (base_blkno, delta_blkno)
+ *      2. Delta Pages    – modifications prepended as overflow page chains
+ *      3. Consolidation  – merge delta chain into a new base page
+ *      4. SMO            – split/merge via delta records
+ *
+ *    All state lives in shared buffer pages so every backend sees the
+ *    same index.
  *
  * src/include/access/bwtree.h
  *
@@ -24,334 +22,254 @@
 #define BWTREE_H
 
 #include "access/amapi.h"
+#include "access/itup.h"
+#include "access/sdir.h"
 #include "commands/vacuum.h"
 #include "nodes/pathnodes.h"
-#include "nodes/pg_list.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
 /* ----------------------------------------------------------------
  *  Constants
  * ---------------------------------------------------------------- */
-#define BWTREE_MAGIC   0x42575452
-#define BWTREE_VERSION 1
 
-#define BWTREE_OPTIONS_PROC 5
-#define BWTREE_NPROCS       5
+#define BWTREE_MAGIC        0x42575452
+#define BWTREE_VERSION      1
+#define BWTREE_METAPAGE     0
+#define BWTREE_PAGE_ID      0xFF90
 
-#define BWTREE_DELTA_CHAIN_THRESHOLD 8
+#define BWT_READ            BUFFER_LOCK_SHARE
+#define BWT_WRITE           BUFFER_LOCK_EXCLUSIVE
+#define BWT_NOLOCK          (-1)
 
-/* Progress phase numbers for CREATE INDEX reporting */
-#define PROGRESS_BWTREE_PHASE_TABLE_SCAN           2
-#define PROGRESS_BWTREE_PHASE_SORT_LOAD            3
-#define PROGRESS_BWTREE_PHASE_MAPPING_TABLE_LOAD   4
-#define PROGRESS_BWTREE_PHASE_DELTA_CONSOLIDATION  5
+/* Page type flags stored in bwto_flags */
+#define BWT_LEAF            (1 << 0)
+#define BWT_ROOT            (1 << 1)
+#define BWT_DELETED         (1 << 2)
+#define BWT_META            (1 << 3)
+#define BWT_DELTA           (1 << 4)
 
-/* ----------------------------------------------------------------
- *  Bw-tree specific data types
- * ---------------------------------------------------------------- */
+/* AM support procedure numbers (reuse btree strategies) */
+#define BWTORDER_PROC       1
+#define BWTNProcs           1
 
-typedef uint64 BWTreePid;          /* logical page identifier */
-
-/*
- * Delta record types.
- *
- * Each modification to a Bw-tree page is recorded as a delta record that
- * is prepended to the delta chain.  The type determines how the record
- * should be interpreted during search or consolidation.
- */
-typedef enum BWTreeDeltaType
-{
-	BW_DELTA_INSERT,               /* key-value insert */
-	BW_DELTA_DELETE,               /* key-value delete */
-	BW_DELTA_UPDATE,               /* in-place value update */
-	BW_DELTA_SPLIT,                /* split delta: marks key range moved */
-	BW_DELTA_SEPARATOR,            /* separator/index-entry delta in parent */
-	BW_DELTA_MERGE,                /* merge delta on the receiving page */
-	BW_DELTA_REMOVE_NODE           /* marks a page logically removed */
-} BWTreeDeltaType;
-
-/*
- * A single delta record.
- *
- * The record sits at the head of the delta chain for a logical page.
- * `next` points to the previous delta or, at the end of the chain, to
- * the base page.
- */
-typedef struct BWTreeDeltaRecord
-{
-	BWTreeDeltaType type;
-
-	/* key that this delta operates on (for INSERT / DELETE / UPDATE) */
-	Datum           key;
-	bool            key_is_null;
-
-	/* heap TID for this index entry */
-	ItemPointerData heap_tid;
-
-	/* split/separator specific */
-	Datum           split_key;         /* separator key for SPLIT / SEPARATOR */
-	BWTreePid       sibling_pid;       /* logical id of the new sibling page */
-
-	/* chain link */
-	struct BWTreeDeltaRecord *next;    /* next older delta or base-page ptr */
-} BWTreeDeltaRecord;
-
-/*
- * A Bw-tree base page (leaf or internal).
- *
- * After consolidation, all deltas are merged into a sorted array of
- * index tuples stored inside a base page.  Between consolidations the
- * page is immutable; new changes go into delta records.
- */
-typedef struct BWTreeBasePage
-{
-	bool            is_leaf;
-	BWTreePid       pid;               /* this page's logical id */
-	BWTreePid       right_sibling_pid; /* right-link for range scans */
-	Datum           low_key;           /* inclusive lower bound */
-	Datum           high_key;          /* exclusive upper bound */
-
-	int             num_items;
-	int             max_items;
-	/* flexible array: sorted index tuples follow */
-} BWTreeBasePage;
-
-/*
- * Unified node handle.
- *
- * The mapping table stores pointers to BWTreeNode.  A node is either a
- * delta chain head (delta != NULL) or a consolidated base page.
- */
-typedef struct BWTreeNode
-{
-	BWTreeDeltaRecord *delta_chain_head;
-	BWTreeBasePage    *base_page;
-	int                delta_chain_len;
-} BWTreeNode;
+#define BWTREE_DELTA_CHAIN_THRESHOLD    8
+#define BWTREE_MAX_MAP_PAGES            200
 
 /* ----------------------------------------------------------------
- *  Mapping Table
- *
- *  Maps BWTreePid -> BWTreeNode*.  CAS on the pointer is used to
- *  install new delta records or swap in a consolidated page without
- *  latches.
+ *  Logical page identifier
  * ---------------------------------------------------------------- */
-typedef struct BWTreeMappingEntry
-{
-	BWTreePid       pid;
-	BWTreeNode     *node;              /* physical pointer (CAS target) */
-} BWTreeMappingEntry;
 
-typedef struct BWTreeMappingTable
-{
-	int              capacity;
-	int              num_entries;
-	BWTreePid        next_pid;         /* monotonically increasing PID allocator */
-	BWTreeMappingEntry *entries;
-} BWTreeMappingTable;
+typedef uint32 BWTreePid;
+#define InvalidBWTreePid    ((BWTreePid) 0xFFFFFFFF)
 
 /* ----------------------------------------------------------------
- *  Epoch-based Reclamation
- *
- *  Threads enter/leave epochs.  Pointers retired during epoch E can
- *  only be freed once no thread is still in epoch <= E.
- *
- *  In PostgreSQL each backend is a single-threaded process.  The
- *  epoch mechanism still matters because an ongoing index scan may
- *  hold a reference to a node that is being replaced by a concurrent
- *  consolidation or SMO in the same transaction.
+ *  Meta page  (block 0, accessed via PageGetContents)
  * ---------------------------------------------------------------- */
 
-typedef struct BWTreeRetiredEntry
-{
-	void       *ptr;               /* palloc'd object to be freed */
-	uint64      retired_epoch;     /* epoch at which this was retired */
-	struct BWTreeRetiredEntry *next;
-} BWTreeRetiredEntry;
-
-typedef struct BWTreeEpochManager
-{
-	uint64  global_epoch;          /* monotonically increasing counter */
-	uint64  local_epoch;           /* epoch this backend entered (0 = none) */
-	bool    in_epoch;              /* true between enter() and leave() */
-	int     nesting;               /* allow nested enter/leave pairs */
-
-	BWTreeRetiredEntry *retired_head;  /* singly-linked list */
-	int     retired_count;
-} BWTreeEpochManager;
-
-/* ----------------------------------------------------------------
- *  Meta page (block 0 of the index)
- * ---------------------------------------------------------------- */
 typedef struct BWTreeMetaPageData
 {
 	uint32      bwt_magic;
 	uint32      bwt_version;
-	BlockNumber bwt_root;
 	BWTreePid   bwt_root_pid;
+	uint32      bwt_level;
+	BWTreePid   bwt_next_pid;
+	double      bwt_num_tuples;
+	uint32      bwt_num_map_pages;
+	BlockNumber bwt_map_blknos[BWTREE_MAX_MAP_PAGES];
 } BWTreeMetaPageData;
 
-typedef struct BWTreeOptions
+#define BWTreeMetaPageGetData(page) \
+	((BWTreeMetaPageData *) PageGetContents(page))
+
+/* ----------------------------------------------------------------
+ *  Mapping page
+ *
+ *  Each page stores a flat array of BWTreeMapEntry accessed via
+ *  PageGetContents.  PID N lives on mapping page N / ENTRIES_PER_PAGE
+ *  at offset N % ENTRIES_PER_PAGE.
+ * ---------------------------------------------------------------- */
+
+typedef struct BWTreeMapEntry
 {
-	int32       vl_len_;
-	int         fillfactor;
-	bool        enable_delta_consolidation;
-} BWTreeOptions;
+	BlockNumber base_blkno;
+	BlockNumber delta_blkno;
+} BWTreeMapEntry;
+
+#define BWTREE_MAP_ENTRIES_PER_PAGE \
+	((int)((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) / sizeof(BWTreeMapEntry)))
+
+#define BWTreeMapPageGetEntries(page) \
+	((BWTreeMapEntry *) PageGetContents(page))
+
+/* ----------------------------------------------------------------
+ *  Page opaque  (special space for base + delta pages)
+ * ---------------------------------------------------------------- */
+
+typedef struct BWTreePageOpaqueData
+{
+	BlockNumber bwto_prev;      /* left sibling  (base pages) */
+	BlockNumber bwto_next;      /* right sibling (base) / next delta (delta) */
+	BWTreePid   bwto_pid;       /* logical PID of this page */
+	uint32      bwto_level;     /* 0 = leaf */
+	uint16      bwto_flags;     /* BWT_LEAF | BWT_ROOT | BWT_DELTA … */
+	uint16      bwto_page_id;   /* BWTREE_PAGE_ID for identification */
+} BWTreePageOpaqueData;
+
+typedef BWTreePageOpaqueData *BWTreePageOpaque;
+
+#define BWTreePageGetOpaque(page) \
+	((BWTreePageOpaque) PageGetSpecialPointer(page))
+
+#define BWTreePageIsLeaf(opaque)    (((opaque)->bwto_flags & BWT_LEAF) != 0)
+#define BWTreePageIsRoot(opaque)    (((opaque)->bwto_flags & BWT_ROOT) != 0)
+#define BWTreePageIsDeleted(opaque) (((opaque)->bwto_flags & BWT_DELETED) != 0)
+#define BWTreePageIsDelta(opaque)   (((opaque)->bwto_flags & BWT_DELTA) != 0)
+
+/* Internal-page downlink helpers (PID stored in t_tid block field) */
+#define BWTreeTupleGetDownLink(itup) \
+	((BWTreePid) ItemPointerGetBlockNumberNoCheck(&(itup)->t_tid))
+
+#define BWTreeTupleSetDownLink(itup, pid) \
+	ItemPointerSetBlockNumber(&(itup)->t_tid, (BlockNumber)(pid))
+
+/* ----------------------------------------------------------------
+ *  Delta record  (stored as items on delta pages)
+ * ---------------------------------------------------------------- */
+
+typedef enum BWTreeDeltaType
+{
+	BW_DELTA_INSERT,
+	BW_DELTA_DELETE,
+	BW_DELTA_SPLIT,
+	BW_DELTA_SEPARATOR,
+	BW_DELTA_MERGE,
+	BW_DELTA_REMOVE_NODE
+} BWTreeDeltaType;
+
+typedef struct BWTreeDeltaRecordData
+{
+	BWTreeDeltaType type;
+	BWTreePid       related_pid;    /* SPLIT: sibling; SEPARATOR: child */
+	uint16          data_len;       /* byte length of trailing IndexTuple */
+} BWTreeDeltaRecordData;
+
+#define SizeOfBWTreeDeltaRecord sizeof(BWTreeDeltaRecordData)
+
+#define BWTreeDeltaRecordGetTuple(drec) \
+	((drec)->data_len > 0 \
+	 ? (IndexTuple)((char *)(drec) + SizeOfBWTreeDeltaRecord) \
+	 : NULL)
+
+#define BWTreeDeltaRecordSize(drec) \
+	((Size)(SizeOfBWTreeDeltaRecord + (drec)->data_len))
 
 /* ----------------------------------------------------------------
  *  Scan opaque (private state for an index scan)
  * ---------------------------------------------------------------- */
+
+typedef struct BWTreeScanPosItem
+{
+	ItemPointerData heapTid;
+} BWTreeScanPosItem;
+
 typedef struct BWTreeScanOpaqueData
 {
-	BWTreePid       cur_pid;           /* current leaf page PID */
-	int             cur_item_index;    /* position within consolidated view */
-	bool            scan_started;
-	ScanDirection   scan_dir;
+	bool        started;
+	BWTreePid   cur_leaf_pid;
+	int         cur_item;
+	int         num_items;
+	BWTreeScanPosItem *items;
+
+	int         numberOfKeys;
+	ScanKey     keyData;
 } BWTreeScanOpaqueData;
 
 typedef BWTreeScanOpaqueData *BWTreeScanOpaque;
 
 /* ================================================================
- *  PUBLIC  AM  CALLBACKS
+ *  PUBLIC AM CALLBACKS
  * ================================================================ */
 
 extern Datum bwtreehandler(PG_FUNCTION_ARGS);
 
-/* bwtreesort.c – build */
 extern IndexBuildResult *bwtreebuild(Relation heap, Relation index,
 									 struct IndexInfo *indexInfo);
 extern void bwtreebuildempty(Relation index);
-extern char *bwtreebuildphasename(int64 phasenum);
-
-/* bwtreeinsert.c – insert */
 extern bool bwtreeinsert(Relation rel, Datum *values, bool *isnull,
 						 ItemPointer ht_ctid, Relation heapRel,
 						 IndexUniqueCheck checkUnique,
 						 bool indexUnchanged,
 						 struct IndexInfo *indexInfo);
-extern void bwtreeinsertcleanup(Relation index, struct IndexInfo *indexInfo);
-
-/* bwtreescan.c – scan */
 extern IndexScanDesc bwtreebeginscan(Relation rel, int nkeys, int norderbys);
 extern void bwtreerescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 						 ScanKey orderbys, int norderbys);
 extern bool bwtreegettuple(IndexScanDesc scan, ScanDirection dir);
 extern int64 bwtreegetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern void bwtreeendscan(IndexScanDesc scan);
-extern void bwtreemarkpos(IndexScanDesc scan);
-extern void bwtreerestrpos(IndexScanDesc scan);
-extern Size bwtreeestimateparallelscan(int nkeys, int norderbys);
-extern void bwtreeinitparallelscan(void *target);
-extern void bwtreeparallelrescan(IndexScanDesc scan);
-
-/* bwtree.c – vacuum */
 extern IndexBulkDeleteResult *bwtreebulkdelete(IndexVacuumInfo *info,
 											   IndexBulkDeleteResult *stats,
 											   IndexBulkDeleteCallback callback,
 											   void *callback_state);
 extern IndexBulkDeleteResult *bwtreevacuumcleanup(IndexVacuumInfo *info,
 												  IndexBulkDeleteResult *stats);
-
-/* bwtreeutils.c – planner / cost / options */
-extern bool bwtreecanreturn(Relation index, int attno);
 extern void bwtreecostestimate(PlannerInfo *root, IndexPath *path,
 							   double loop_count,
-							   Cost *indexStartupCost,
-							   Cost *indexTotalCost,
+							   Cost *indexStartupCost, Cost *indexTotalCost,
 							   Selectivity *indexSelectivity,
-							   double *indexCorrelation,
-							   double *indexPages);
+							   double *indexCorrelation, double *indexPages);
 extern bytea *bwtreeoptions(Datum reloptions, bool validate);
-extern bool bwtreeproperty(Oid index_oid, int attno,
-						   IndexAMProperty prop, const char *propname,
-						   bool *res, bool *isnull);
-
-/* bwtreevalidate.c – opclass validation */
 extern bool bwtreevalidate(Oid opclassoid);
-extern void bwtreeadjustmembers(Oid opfamilyoid,
-								Oid opclassoid,
-								List *operators,
-								List *functions);
+extern void bwtreeadjustmembers(Oid opfamilyoid, Oid opclassoid,
+								List *operators, List *functions);
+extern char *bwtreebuildphasename(int64 phasenum);
 
 /* ================================================================
- *  INTERNAL  FUNCTIONS  (Bw-tree core components)
+ *  INTERNAL FUNCTIONS
  * ================================================================ */
 
-/* --- bwtreepage.c: page management -------------------------------- */
-extern void bwtree_init_metapage(Page page);
-extern void bwtree_init_page(Page page, Size size);
+/* --- bwtreepage.c ------------------------------------------------ */
+extern Buffer _bwt_getbuf(Relation rel, BlockNumber blkno, int access);
+extern void _bwt_relbuf(Relation rel, Buffer buf);
+extern Buffer _bwt_allocbuf(Relation rel);
+extern void _bwt_initpage(Page page, uint16 flags, BWTreePid pid, uint32 level);
+extern void _bwt_initmetapage(Page page, BWTreePid root_pid, uint32 level);
 
-/* --- bwtreemap.c: mapping table ----------------------------------- */
-extern BWTreeMappingTable *bwtree_map_create(int capacity);
-extern void bwtree_map_destroy(BWTreeMappingTable *mt);
-extern BWTreePid bwtree_map_alloc_pid(BWTreeMappingTable *mt);
-extern BWTreeNode *bwtree_map_get(BWTreeMappingTable *mt, BWTreePid pid);
-extern bool bwtree_map_cas(BWTreeMappingTable *mt, BWTreePid pid,
-						   BWTreeNode *expected, BWTreeNode *desired);
+/* --- bwtreemap.c ------------------------------------------------- */
+extern bool _bwt_map_lookup(Relation rel, BWTreeMetaPageData *metad,
+							BWTreePid pid,
+							BlockNumber *base_blkno, BlockNumber *delta_blkno);
+extern void _bwt_map_update(Relation rel, BWTreeMetaPageData *metad,
+							BWTreePid pid,
+							BlockNumber base_blkno, BlockNumber delta_blkno);
+extern BWTreePid _bwt_map_alloc_pid(Relation rel, BWTreeMetaPageData *metad,
+									BlockNumber base_blkno,
+									BlockNumber delta_blkno);
+extern BlockNumber _bwt_map_ensure_page(Relation rel,
+										BWTreeMetaPageData *metad,
+										int map_page_idx);
 
-/* --- bwtreedelta.c: delta record operations ----------------------- */
-extern BWTreeDeltaRecord *bwtree_delta_create(BWTreeDeltaType type);
-extern bool bwtree_delta_install_insert(BWTreeMappingTable *mt,
-										BWTreePid pid,
-										Datum key, bool key_is_null,
-										ItemPointer heap_tid);
-extern bool bwtree_delta_install_delete(BWTreeMappingTable *mt,
-										BWTreePid pid,
-										Datum key, bool key_is_null,
-										ItemPointer heap_tid);
-extern bool bwtree_delta_install_split(BWTreeMappingTable *mt,
-									   BWTreePid pid,
-									   Datum split_key,
-									   BWTreePid new_sibling_pid);
-extern bool bwtree_delta_install_separator(BWTreeMappingTable *mt,
-										   BWTreePid parent_pid,
-										   Datum split_key,
-										   BWTreePid new_child_pid);
-extern bool bwtree_delta_install_merge(BWTreeMappingTable *mt,
-									   BWTreePid pid,
-									   BWTreePid merged_sibling_pid);
-extern bool bwtree_delta_install_remove_node(BWTreeMappingTable *mt,
-											 BWTreePid pid);
+/* --- bwtreedelta.c ----------------------------------------------- */
+extern void _bwt_delta_install(Relation rel, BWTreeMetaPageData *metad,
+							   BWTreePid pid, BWTreeDeltaType type,
+							   IndexTuple itup, BWTreePid related_pid);
+extern int _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
+							Page base_page, OffsetNumber *maxoff);
 
-extern bool bwtree_delta_chain_search(BWTreeNode *node, Datum key,
-									  ScanKey scankey,
-									  ItemPointer result_tid);
-extern void bwtree_delta_chain_collect(BWTreeNode *node,
-									   BWTreeBasePage **out_page);
+/* --- bwtreesearch.c ---------------------------------------------- */
+extern BWTreePid _bwt_search_leaf(Relation rel, BWTreeMetaPageData *metad,
+								  ScanKey scankey, int nkeys);
+extern int32 _bwt_compare(Relation rel, ScanKey scankey, int nkeys,
+						   Page page, OffsetNumber offnum);
 
-/* --- bwtreeconsolidate.c: consolidation --------------------------- */
-extern bool bwtree_should_consolidate(BWTreeNode *node,
-									  uint32 threshold);
-extern BWTreeBasePage *bwtree_consolidate(BWTreeMappingTable *mt,
-										  BWTreePid pid);
+/* --- bwtreeconsolidate.c ----------------------------------------- */
+extern void _bwt_consolidate(Relation rel, BWTreeMetaPageData *metad,
+							 BWTreePid pid);
+extern bool _bwt_should_consolidate(Relation rel, BWTreeMetaPageData *metad,
+									BWTreePid pid);
 
-/* --- bwtreesmo.c: Structure Modification Operations --------------- */
-extern bool bwtree_smo_split(BWTreeMappingTable *mt,
-							 BWTreePid pid,
-							 BWTreePid parent_pid);
-extern bool bwtree_smo_merge(BWTreeMappingTable *mt,
-							 BWTreePid left_pid,
-							 BWTreePid right_pid,
-							 BWTreePid parent_pid);
-
-/* --- bwtreeepoch.c: epoch-based reclamation ----------------------- */
-extern BWTreeEpochManager *bwtree_epoch_create(void);
-extern void bwtree_epoch_destroy(BWTreeEpochManager *em);
-extern void bwtree_epoch_enter(BWTreeEpochManager *em);
-extern void bwtree_epoch_leave(BWTreeEpochManager *em);
-extern void bwtree_epoch_retire(BWTreeEpochManager *em, void *ptr);
-extern void bwtree_epoch_reclaim(BWTreeEpochManager *em);
-
-/* --- bwtreesearch.c: tree traversal ------------------------------- */
-extern BWTreePid bwtree_search_leaf(BWTreeMappingTable *mt,
-									BWTreePid root_pid,
-									Datum key, ScanKey scankey);
-extern bool bwtree_search(BWTreeMappingTable *mt,
-						  BWTreePid root_pid,
-						  Datum key, ScanKey scankey,
-						  ItemPointer result_tid);
-extern BWTreePid bwtree_search_next_leaf(BWTreeMappingTable *mt,
-										 BWTreePid cur_pid);
+/* --- bwtreesmo.c ------------------------------------------------- */
+extern void _bwt_split(Relation rel, BWTreeMetaPageData *metad,
+					   Buffer leafbuf, BWTreePid leaf_pid);
 
 #endif							/* BWTREE_H */

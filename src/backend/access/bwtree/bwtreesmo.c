@@ -1,72 +1,99 @@
 /*-------------------------------------------------------------------------
  *
  * bwtreesmo.c
- *    Structure Modification Operations (SMO) for the Bw-tree.
+ *    Structure Modification Operations for the Bw-tree.
  *
- *    Bw-tree splits and merges are performed latch-free via two-phase
- *    delta-record protocols.
+ *    Split uses two-phase delta records:
+ *      Phase 1: SPLIT delta on the overflowing leaf
+ *      Phase 2: SEPARATOR delta on the parent
  *
- *    === SPLIT (two-phase) ===
- *    Phase 1 – child side:
- *      1. Create a new sibling page with the upper half of keys.
- *      2. Install a SPLIT delta on the original page recording the
- *         split key and the logical pointer (PID) to the new sibling.
- *         (CAS on the original page's mapping-table entry.)
- *
- *    Phase 2 – parent side:
- *      3. Install a SEPARATOR (index-entry) delta on the parent page
- *         that adds the new child PID for the split key range.
- *         (CAS on the parent page's mapping-table entry.)
- *
- *    === MERGE (two-phase) ===
- *    Phase 1 – removed child:
- *      1. Install a REMOVE_NODE delta on the page being removed.
- *
- *    Phase 2 – absorbing sibling + parent:
- *      2. Install a MERGE delta on the left sibling that logically
- *         absorbs the removed page's key range.
- *      3. Remove the separator in the parent for the merged child.
+ *    This is a simplified initial implementation.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/bwtree.h"
+#include "storage/bufmgr.h"
 
 /*
- * Perform a latch-free split on the leaf/internal page identified by `pid`.
- * `parent_pid` is used for the second phase (separator delta).
+ * Split a leaf page that has become too full.
  *
- * Returns true on success; false if any CAS step failed (caller retries).
+ * Steps:
+ *   1. Read the leaf base page (with deltas consolidated).
+ *   2. Create a new sibling page with the upper half of items.
+ *   3. Allocate a PID for the sibling and add to mapping table.
+ *   4. Install a SPLIT delta on the original leaf.
+ *   5. (TODO) Install a SEPARATOR delta on the parent.
  */
-bool
-bwtree_smo_split(BWTreeMappingTable *mt,
-				 BWTreePid pid,
-				 BWTreePid parent_pid)
+void
+_bwt_split(Relation rel, BWTreeMetaPageData *metad,
+		   Buffer leafbuf, BWTreePid leaf_pid)
 {
-	(void) mt;
-	(void) pid;
-	(void) parent_pid;
+	Page		leafpage;
+	OffsetNumber maxoff;
+	OffsetNumber midoff;
+	OffsetNumber off;
+	Buffer		newbuf;
+	Page		newpage;
+	BWTreePageOpaque leaf_opaque;
+	BWTreePageOpaque new_opaque;
+	BWTreePid	new_pid;
+	IndexTuple	mid_itup;
 
-	return false;
-}
+	leafpage = BufferGetPage(leafbuf);
+	maxoff = PageGetMaxOffsetNumber(leafpage);
 
-/*
- * Perform a latch-free merge: `right_pid` is absorbed into `left_pid`.
- * `parent_pid` is used to remove the separator key.
- *
- * Returns true on success; false if any CAS step failed.
- */
-bool
-bwtree_smo_merge(BWTreeMappingTable *mt,
-				 BWTreePid left_pid,
-				 BWTreePid right_pid,
-				 BWTreePid parent_pid)
-{
-	(void) mt;
-	(void) left_pid;
-	(void) right_pid;
-	(void) parent_pid;
+	if (maxoff < 2)
+		return;
 
-	return false;
+	midoff = maxoff / 2 + 1;
+
+	/* allocate new sibling page */
+	newbuf = _bwt_allocbuf(rel);
+	newpage = BufferGetPage(newbuf);
+	_bwt_initpage(newpage, BWT_LEAF, InvalidBWTreePid, 0);
+
+	/* copy upper half to new page */
+	for (off = midoff; off <= maxoff; off++)
+	{
+		ItemId		iid = PageGetItemId(leafpage, off);
+		IndexTuple	itup;
+
+		if (!ItemIdIsUsed(iid))
+			continue;
+
+		itup = (IndexTuple) PageGetItem(leafpage, iid);
+		if (PageAddItem(newpage, (Item) itup, IndexTupleSize(itup),
+						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+			elog(ERROR, "bwtree: split failed to add item to new page");
+	}
+
+	/* set up sibling links */
+	leaf_opaque = BWTreePageGetOpaque(leafpage);
+	new_opaque = BWTreePageGetOpaque(newpage);
+
+	new_opaque->bwto_prev = BufferGetBlockNumber(leafbuf);
+	new_opaque->bwto_next = leaf_opaque->bwto_next;
+
+	MarkBufferDirty(newbuf);
+
+	/* register sibling in mapping table */
+	new_pid = _bwt_map_alloc_pid(rel, metad,
+								 BufferGetBlockNumber(newbuf),
+								 InvalidBlockNumber);
+	new_opaque->bwto_pid = new_pid;
+	MarkBufferDirty(newbuf);
+
+	/* install SPLIT delta on original leaf */
+	mid_itup = (IndexTuple) PageGetItem(leafpage,
+										PageGetItemId(leafpage, midoff));
+	_bwt_delta_install(rel, metad, leaf_pid,
+					   BW_DELTA_SPLIT, mid_itup, new_pid);
+
+	/* update original leaf's right link */
+	leaf_opaque->bwto_next = BufferGetBlockNumber(newbuf);
+	MarkBufferDirty(leafbuf);
+
+	_bwt_relbuf(rel, newbuf);
 }

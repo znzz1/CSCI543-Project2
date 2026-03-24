@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * bwtreevalidate.c
- *    Opclass validation scaffolding for the Bw-tree access method.
+ *    Opclass validation for the Bw-tree.
  *
  *-------------------------------------------------------------------------
  */
@@ -13,7 +13,6 @@ bool
 bwtreevalidate(Oid opclassoid)
 {
 	(void) opclassoid;
-
 	return true;
 }
 

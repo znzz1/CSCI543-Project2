@@ -1979,4 +1979,8 @@
 { amprocfamily => 'brin/box_inclusion_ops', amproclefttype => 'box',
   amprocrighttype => 'box', amprocnum => '13', amproc => 'box_contain' },
 
+# bwtree int4 support function (comparison)
+{ amprocfamily => 'bwtree/integer_ops', amproclefttype => 'int4',
+  amprocrighttype => 'int4', amprocnum => '1', amproc => 'btint4cmp' },
+
 ]

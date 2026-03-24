@@ -6,7 +6,6 @@ OBJS = \
 	bwtree.o \
 	bwtreeconsolidate.o \
 	bwtreedelta.o \
-	bwtreeepoch.o \
 	bwtreeinsert.o \
 	bwtreemap.o \
 	bwtreepage.o \

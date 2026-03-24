@@ -485,6 +485,6 @@
 { oid => '9100',
   opcmethod => 'bwtree',
   opcname => 'int4_bwtree_ops',
-  opcfamily => 'btree/integer_ops',
+  opcfamily => 'bwtree/integer_ops',
   opcintype => 'int4' },
 ]

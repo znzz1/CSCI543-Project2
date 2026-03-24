@@ -4,7 +4,6 @@ backend_sources += files(
   'bwtree.c',
   'bwtreeconsolidate.c',
   'bwtreedelta.c',
-  'bwtreeepoch.c',
   'bwtreeinsert.c',
   'bwtreemap.c',
   'bwtreepage.c',

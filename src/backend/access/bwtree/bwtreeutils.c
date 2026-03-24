@@ -1,22 +1,14 @@
 /*-------------------------------------------------------------------------
  *
  * bwtreeutils.c
- *    Utility and planner callback scaffolding for the Bw-tree access method.
+ *    Planner support and relation options for the Bw-tree.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/bwtree.h"
-
-bool
-bwtreecanreturn(Relation index, int attno)
-{
-	(void) index;
-	(void) attno;
-
-	return false;
-}
+#include "utils/selfuncs.h"
 
 void
 bwtreecostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -24,15 +16,15 @@ bwtreecostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				   Selectivity *indexSelectivity, double *indexCorrelation,
 				   double *indexPages)
 {
-	(void) root;
-	(void) path;
-	(void) loop_count;
+	GenericCosts costs = {0};
 
-	*indexStartupCost = 1.0e10;
-	*indexTotalCost = 1.0e10;
-	*indexSelectivity = 1.0;
-	*indexCorrelation = 0.0;
-	*indexPages = 1.0;
+	genericcostestimate(root, path, loop_count, &costs);
+
+	*indexStartupCost = costs.indexStartupCost;
+	*indexTotalCost   = costs.indexTotalCost;
+	*indexSelectivity = costs.indexSelectivity;
+	*indexCorrelation = costs.indexCorrelation;
+	*indexPages       = costs.numIndexPages;
 }
 
 bytea *
@@ -40,21 +32,5 @@ bwtreeoptions(Datum reloptions, bool validate)
 {
 	(void) reloptions;
 	(void) validate;
-
 	return NULL;
-}
-
-bool
-bwtreeproperty(Oid index_oid, int attno,
-			   IndexAMProperty prop, const char *propname,
-			   bool *res, bool *isnull)
-{
-	(void) index_oid;
-	(void) attno;
-	(void) prop;
-	(void) propname;
-	(void) res;
-	(void) isnull;
-
-	return false;
 }

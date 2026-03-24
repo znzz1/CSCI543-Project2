@@ -1,11 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * bwtree.c
- *    Public access-method entry points for the Bw-tree index.
- *
- *    The Bw-tree is a latch-free index structure (ICDE 2013) that uses
- *    a mapping table, delta chains, CAS-based updates, and epoch-based
- *    reclamation instead of the traditional latch-based B+tree approach.
+ *    AM handler and vacuum callbacks for the Bw-tree index.
  *
  *-------------------------------------------------------------------------
  */
@@ -14,25 +10,17 @@
 #include "access/bwtree.h"
 #include "access/stratnum.h"
 
-/*
- * Bw-tree handler function: return IndexAmRoutine with access method
- * parameters and callbacks.
- *
- * Bw-tree supports ordered access (like B+tree) but is latch-free.
- * Several features that are B+tree-specific (CLUSTER, parallel scan,
- * INCLUDE columns) are disabled for the initial implementation.
- */
 Datum
 bwtreehandler(PG_FUNCTION_ARGS)
 {
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
 	amroutine->amstrategies = BTMaxStrategyNumber;
-	amroutine->amsupport = BWTREE_NPROCS;
-	amroutine->amoptsprocnum = BWTREE_OPTIONS_PROC;
+	amroutine->amsupport = BWTNProcs;
+	amroutine->amoptsprocnum = 0;
 	amroutine->amcanorder = true;
 	amroutine->amcanorderbyop = false;
-	amroutine->amcanbackward = true;
+	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = true;
 	amroutine->amoptionalkey = true;
@@ -44,7 +32,7 @@ bwtreehandler(PG_FUNCTION_ARGS)
 	amroutine->amcanparallel = false;
 	amroutine->amcanbuildparallel = false;
 	amroutine->amcaninclude = false;
-	amroutine->amusemaintenanceworkmem = false;
+	amroutine->amusemaintenanceworkmem = true;
 	amroutine->amsummarizing = false;
 	amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
 	amroutine->amkeytype = InvalidOid;
