@@ -4,7 +4,6 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	bwtree.o \
-	bwtreeconsolidate.o \
 	bwtreedelta.o \
 	bwtreeinsert.o \
 	bwtreemap.o \
@@ -12,8 +11,6 @@ OBJS = \
 	bwtreescan.o \
 	bwtreesearch.o \
 	bwtreesmo.o \
-	bwtreesort.o \
-	bwtreeutils.o \
-	bwtreevalidate.o
+	bwtreesort.o
 
 include $(top_srcdir)/src/backend/common.mk

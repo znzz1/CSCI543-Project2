@@ -1,99 +1,80 @@
 /*-------------------------------------------------------------------------
  *
  * bwtreesmo.c
- *    Structure Modification Operations for the Bw-tree.
+ *    Structure-modification skeleton for the Bw-tree index.
  *
- *    Split uses two-phase delta records:
- *      Phase 1: SPLIT delta on the overflowing leaf
- *      Phase 2: SEPARATOR delta on the parent
- *
- *    This is a simplified initial implementation.
- *
- *-------------------------------------------------------------------------
- */
+ *------------------------------------------------------------------------- */
 #include "postgres.h"
 
 #include "access/bwtree.h"
-#include "storage/bufmgr.h"
 
-/*
- * Split a leaf page that has become too full.
- *
- * Steps:
- *   1. Read the leaf base page (with deltas consolidated).
- *   2. Create a new sibling page with the upper half of items.
- *   3. Allocate a PID for the sibling and add to mapping table.
- *   4. Install a SPLIT delta on the original leaf.
- *   5. (TODO) Install a SEPARATOR delta on the parent.
- */
+bool
+_bwt_prepare_split(Relation rel, BWTreeMetaPageData *metad,
+				   BWTreePid pid, BWTreeNodeView *view)
+{
+	(void) rel;
+	(void) metad;
+	(void) pid;
+	(void) view;
+
+	elog(ERROR, "bwtree: prepare-split interface defined but implementation not written yet");
+	return false;
+}
+
+void
+_bwt_finish_split(Relation rel, BWTreeMetaPageData *metad,
+				  BWTreePid pid, BWTreePid parent_pid,
+				  BWTreeNodeView *view)
+{
+	(void) rel;
+	(void) metad;
+	(void) pid;
+	(void) parent_pid;
+	(void) view;
+
+	elog(ERROR, "bwtree: finish-split interface defined but implementation not written yet");
+}
+
+void
+_bwt_install_new_root(Relation rel, BWTreeMetaPageData *metad,
+					  BWTreePid left_pid, BWTreePid right_pid,
+					  IndexTuple sep_itup, uint32 child_level)
+{
+	(void) rel;
+	(void) metad;
+	(void) left_pid;
+	(void) right_pid;
+	(void) sep_itup;
+	(void) child_level;
+
+	elog(ERROR, "bwtree: install-new-root interface defined but implementation not written yet");
+}
+
+void
+_bwt_insert_item(Relation rel, BWTreeMetaPageData *metad,
+				 BWTreePid pid, BWTreePid parent_pid,
+				 IndexTuple itup, bool is_leaf)
+{
+	(void) rel;
+	(void) metad;
+	(void) pid;
+	(void) parent_pid;
+	(void) itup;
+	(void) is_leaf;
+
+	elog(ERROR, "bwtree: SMO insert interface defined but implementation not written yet");
+}
+
 void
 _bwt_split(Relation rel, BWTreeMetaPageData *metad,
-		   Buffer leafbuf, BWTreePid leaf_pid)
+		   Buffer leafbuf, BWTreePid leaf_pid,
+		   BWTreePid parent_pid)
 {
-	Page		leafpage;
-	OffsetNumber maxoff;
-	OffsetNumber midoff;
-	OffsetNumber off;
-	Buffer		newbuf;
-	Page		newpage;
-	BWTreePageOpaque leaf_opaque;
-	BWTreePageOpaque new_opaque;
-	BWTreePid	new_pid;
-	IndexTuple	mid_itup;
+	(void) rel;
+	(void) metad;
+	(void) leafbuf;
+	(void) leaf_pid;
+	(void) parent_pid;
 
-	leafpage = BufferGetPage(leafbuf);
-	maxoff = PageGetMaxOffsetNumber(leafpage);
-
-	if (maxoff < 2)
-		return;
-
-	midoff = maxoff / 2 + 1;
-
-	/* allocate new sibling page */
-	newbuf = _bwt_allocbuf(rel);
-	newpage = BufferGetPage(newbuf);
-	_bwt_initpage(newpage, BWT_LEAF, InvalidBWTreePid, 0);
-
-	/* copy upper half to new page */
-	for (off = midoff; off <= maxoff; off++)
-	{
-		ItemId		iid = PageGetItemId(leafpage, off);
-		IndexTuple	itup;
-
-		if (!ItemIdIsUsed(iid))
-			continue;
-
-		itup = (IndexTuple) PageGetItem(leafpage, iid);
-		if (PageAddItem(newpage, (Item) itup, IndexTupleSize(itup),
-						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "bwtree: split failed to add item to new page");
-	}
-
-	/* set up sibling links */
-	leaf_opaque = BWTreePageGetOpaque(leafpage);
-	new_opaque = BWTreePageGetOpaque(newpage);
-
-	new_opaque->bwto_prev = BufferGetBlockNumber(leafbuf);
-	new_opaque->bwto_next = leaf_opaque->bwto_next;
-
-	MarkBufferDirty(newbuf);
-
-	/* register sibling in mapping table */
-	new_pid = _bwt_map_alloc_pid(rel, metad,
-								 BufferGetBlockNumber(newbuf),
-								 InvalidBlockNumber);
-	new_opaque->bwto_pid = new_pid;
-	MarkBufferDirty(newbuf);
-
-	/* install SPLIT delta on original leaf */
-	mid_itup = (IndexTuple) PageGetItem(leafpage,
-										PageGetItemId(leafpage, midoff));
-	_bwt_delta_install(rel, metad, leaf_pid,
-					   BW_DELTA_SPLIT, mid_itup, new_pid);
-
-	/* update original leaf's right link */
-	leaf_opaque->bwto_next = BufferGetBlockNumber(newbuf);
-	MarkBufferDirty(leafbuf);
-
-	_bwt_relbuf(rel, newbuf);
+	elog(ERROR, "bwtree: split interface defined but implementation not written yet");
 }

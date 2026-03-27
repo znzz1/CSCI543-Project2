@@ -2,7 +2,6 @@
 
 backend_sources += files(
   'bwtree.c',
-  'bwtreeconsolidate.c',
   'bwtreedelta.c',
   'bwtreeinsert.c',
   'bwtreemap.c',
@@ -11,6 +10,4 @@ backend_sources += files(
   'bwtreesearch.c',
   'bwtreesmo.c',
   'bwtreesort.c',
-  'bwtreeutils.c',
-  'bwtreevalidate.c',
 )

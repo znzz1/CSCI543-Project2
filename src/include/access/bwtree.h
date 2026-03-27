@@ -27,6 +27,7 @@
 #include "commands/vacuum.h"
 #include "nodes/pathnodes.h"
 #include "storage/bufmgr.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 /* ----------------------------------------------------------------
@@ -53,7 +54,7 @@
 #define BWTORDER_PROC       1
 #define BWTNProcs           1
 
-#define BWTREE_DELTA_CHAIN_THRESHOLD    8
+#define BWTREE_DELTA_CHAIN_THRESHOLD    1
 #define BWTREE_MAX_MAP_PAGES            200
 
 /* ----------------------------------------------------------------
@@ -142,16 +143,15 @@ typedef enum BWTreeDeltaType
 	BW_DELTA_INSERT,
 	BW_DELTA_DELETE,
 	BW_DELTA_SPLIT,
-	BW_DELTA_SEPARATOR,
-	BW_DELTA_MERGE,
-	BW_DELTA_REMOVE_NODE
+	BW_DELTA_SEPARATOR
 } BWTreeDeltaType;
 
 typedef struct BWTreeDeltaRecordData
 {
 	BWTreeDeltaType type;
-	BWTreePid       related_pid;    /* SPLIT: sibling; SEPARATOR: child */
-	uint16          data_len;       /* byte length of trailing IndexTuple */
+	BWTreePid       related_pid;    /* SPLIT: sibling; SEPARATOR/inner DELETE: child */
+	ItemPointerData target_tid;     /* leaf DELETE: exact heap TID to remove */
+	uint16          data_len;       /* byte length of trailing IndexTuple key/payload */
 } BWTreeDeltaRecordData;
 
 #define SizeOfBWTreeDeltaRecord sizeof(BWTreeDeltaRecordData)
@@ -182,10 +182,65 @@ typedef struct BWTreeScanOpaqueData
 	BWTreeScanPosItem *items;
 
 	int         numberOfKeys;
+	int         keyDataCapacity;
 	ScanKey     keyData;
 } BWTreeScanOpaqueData;
 
 typedef BWTreeScanOpaqueData *BWTreeScanOpaque;
+
+typedef struct BWTMaterializedPage
+{
+	IndexTuple *items;
+	int			nitems;
+	BlockNumber base_blkno;
+	BlockNumber prev_blkno;
+	BlockNumber next_blkno;
+	uint16		flags;
+	uint32		level;
+} BWTMaterializedPage;
+
+typedef enum BWTreeNodeKind
+{
+	BWT_NODE_BASE_LEAF,
+	BWT_NODE_BASE_INNER,
+	BWT_NODE_DELTA_INSERT,
+	BWT_NODE_DELTA_DELETE,
+	BWT_NODE_DELTA_SPLIT,
+	BWT_NODE_DELTA_SEPARATOR
+} BWTreeNodeKind;
+
+typedef enum BWTreeNodeState
+{
+	BWT_STATE_STABLE,
+	BWT_STATE_SPLIT_PENDING
+} BWTreeNodeState;
+
+typedef struct BWTreeNodeSnapshot
+{
+	BWTreePid	pid;
+	BlockNumber	base_blkno;
+	BlockNumber	delta_blkno;
+	uint32		level;
+	bool		is_leaf;
+	bool		is_root;
+} BWTreeNodeSnapshot;
+
+typedef struct BWTreeNodeView
+{
+	BWTreeNodeSnapshot snapshot;
+	BWTMaterializedPage page;
+	BWTreeNodeState state;
+	bool		has_split_delta;
+	BWTreePid	split_right_pid;
+	IndexTuple	split_separator;
+} BWTreeNodeView;
+
+typedef struct BWTreeContext
+{
+	BWTreePid	stack_pid[64];
+	int			depth;
+	MemoryContext memcxt;
+} BWTreeContext;
 
 /* ================================================================
  *  PUBLIC AM CALLBACKS
@@ -250,26 +305,59 @@ extern BlockNumber _bwt_map_ensure_page(Relation rel,
 										int map_page_idx);
 
 /* --- bwtreedelta.c ----------------------------------------------- */
+extern BWTreeNodeKind _bwt_classify_node(Page page);
 extern void _bwt_delta_install(Relation rel, BWTreeMetaPageData *metad,
 							   BWTreePid pid, BWTreeDeltaType type,
 							   IndexTuple itup, BWTreePid related_pid);
 extern int _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
 							Page base_page, OffsetNumber *maxoff);
+extern bool _bwt_capture_node_snapshot(Relation rel, BWTreeMetaPageData *metad,
+									   BWTreePid pid,
+									   BWTreeNodeSnapshot *snapshot);
+extern void _bwt_materialize_page(Relation rel, BWTreeMetaPageData *metad,
+								  BWTreePid pid, Buffer *basebuf_out,
+								  BWTMaterializedPage *mpage);
+extern void _bwt_free_materialized_page(BWTMaterializedPage *mpage);
+extern void _bwt_materialize_node(Relation rel, BWTreeMetaPageData *metad,
+								  BWTreePid pid, BWTreeNodeView *view);
+extern void _bwt_free_node_view(BWTreeNodeView *view);
 
 /* --- bwtreesearch.c ---------------------------------------------- */
+extern void _bwt_begin_traverse(BWTreeContext *ctx, MemoryContext memcxt);
+extern void _bwt_finish_traverse(BWTreeContext *ctx);
 extern BWTreePid _bwt_search_leaf(Relation rel, BWTreeMetaPageData *metad,
 								  ScanKey scankey, int nkeys);
+extern BWTreePid _bwt_search_leaf_with_parent(Relation rel,
+											  BWTreeMetaPageData *metad,
+											  ScanKey scankey, int nkeys,
+											  BWTreePid *parent_pid);
+extern bool _bwt_descend_to_leaf(Relation rel, BWTreeMetaPageData *metad,
+								 ScanKey scankey, int nkeys,
+								 BWTreeContext *ctx,
+								 BWTreeNodeSnapshot *leaf_snapshot);
 extern int32 _bwt_compare(Relation rel, ScanKey scankey, int nkeys,
 						   Page page, OffsetNumber offnum);
 
-/* --- bwtreeconsolidate.c ----------------------------------------- */
+/* --- bwtreedelta.c ----------------------------------------------- */
 extern void _bwt_consolidate(Relation rel, BWTreeMetaPageData *metad,
 							 BWTreePid pid);
 extern bool _bwt_should_consolidate(Relation rel, BWTreeMetaPageData *metad,
 									BWTreePid pid);
 
 /* --- bwtreesmo.c ------------------------------------------------- */
+extern void _bwt_insert_item(Relation rel, BWTreeMetaPageData *metad,
+							 BWTreePid pid, BWTreePid parent_pid,
+							 IndexTuple itup, bool is_leaf);
+extern bool _bwt_prepare_split(Relation rel, BWTreeMetaPageData *metad,
+							   BWTreePid pid, BWTreeNodeView *view);
+extern void _bwt_finish_split(Relation rel, BWTreeMetaPageData *metad,
+							  BWTreePid pid, BWTreePid parent_pid,
+							  BWTreeNodeView *view);
+extern void _bwt_install_new_root(Relation rel, BWTreeMetaPageData *metad,
+								  BWTreePid left_pid, BWTreePid right_pid,
+								  IndexTuple sep_itup, uint32 child_level);
 extern void _bwt_split(Relation rel, BWTreeMetaPageData *metad,
-					   Buffer leafbuf, BWTreePid leaf_pid);
+					   Buffer leafbuf, BWTreePid leaf_pid,
+					   BWTreePid parent_pid);
 
 #endif							/* BWTREE_H */
