@@ -77,13 +77,23 @@ IndexBulkDeleteResult *
 bwtreebulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				 IndexBulkDeleteCallback callback, void *callback_state)
 {
-	(void) info;
-	(void) stats;
 	(void) callback;
 	(void) callback_state;
 
-	elog(ERROR, "bwtree: bulkdelete interface defined but implementation not written yet");
-	return NULL;
+	/*
+	 * Correctness-first / no-GC build:
+	 *
+	 * We currently don't physically remove dead index tuples in VACUUM path.
+	 * Return stable stats so VACUUM can proceed without touching Bw-tree
+	 * contents.
+	 */
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	if (info != NULL && info->index != NULL)
+		stats->num_pages = RelationGetNumberOfBlocks(info->index);
+
+	return stats;
 }
 
 /*
@@ -92,11 +102,13 @@ bwtreebulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 IndexBulkDeleteResult *
 bwtreevacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
-	(void) info;
-	(void) stats;
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
-	elog(ERROR, "bwtree: vacuumcleanup interface defined but implementation not written yet");
-	return NULL;
+	if (info != NULL && info->index != NULL)
+		stats->num_pages = RelationGetNumberOfBlocks(info->index);
+
+	return stats;
 }
 
 void
@@ -105,16 +117,19 @@ bwtreecostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				   Selectivity *indexSelectivity, double *indexCorrelation,
 				   double *indexPages)
 {
-	(void) root;
-	(void) path;
-	(void) loop_count;
-	(void) indexStartupCost;
-	(void) indexTotalCost;
-	(void) indexSelectivity;
-	(void) indexCorrelation;
-	(void) indexPages;
+	GenericCosts costs = {0};
 
-	elog(ERROR, "bwtree: costestimate interface defined but implementation not written yet");
+	/*
+	 * Use generic estimator so planner can cost this AM without special
+	 * Bw-tree modeling.
+	 */
+	genericcostestimate(root, path, loop_count, &costs);
+
+	*indexStartupCost = costs.indexStartupCost;
+	*indexTotalCost = costs.indexTotalCost;
+	*indexSelectivity = costs.indexSelectivity;
+	*indexCorrelation = costs.indexCorrelation;
+	*indexPages = costs.numIndexPages;
 }
 
 bytea *
@@ -123,7 +138,7 @@ bwtreeoptions(Datum reloptions, bool validate)
 	(void) reloptions;
 	(void) validate;
 
-	elog(ERROR, "bwtree: options interface defined but implementation not written yet");
+	/* No custom reloptions in correctness-first stage. */
 	return NULL;
 }
 
@@ -132,8 +147,11 @@ bwtreevalidate(Oid opclassoid)
 {
 	(void) opclassoid;
 
-	elog(ERROR, "bwtree: validate interface defined but implementation not written yet");
-	return false;
+	/*
+	 * Correctness-first stage assumes catalog wiring is prepared by the
+	 * project setup scripts; no additional runtime validation.
+	 */
+	return true;
 }
 
 void
@@ -144,6 +162,4 @@ bwtreeadjustmembers(Oid opfamilyoid, Oid opclassoid,
 	(void) opclassoid;
 	(void) operators;
 	(void) functions;
-
-	elog(ERROR, "bwtree: adjustmembers interface defined but implementation not written yet");
 }

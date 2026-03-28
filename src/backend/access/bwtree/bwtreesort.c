@@ -7,6 +7,8 @@
 #include "postgres.h"
 
 #include "access/bwtree.h"
+#include "access/genam.h"
+#include "access/tableam.h"
 #include "nodes/execnodes.h"
 #include "storage/bulk_write.h"
 
@@ -56,15 +58,56 @@ _bwt_build_empty_mainfork(Relation index)
 	_bwt_relbuf(index, metabuf, BWT_WRITE);
 }
 
+typedef struct BWTreeBuildState
+{
+	Relation	indexrel;
+	IndexInfo  *indexInfo;
+	double		indtuples;
+} BWTreeBuildState;
+
+static void
+_bwt_build_insert_callback(Relation index, ItemPointer tid, Datum *values,
+						   bool *isnull, bool tupleIsAlive, void *state)
+{
+	BWTreeBuildState *buildstate = (BWTreeBuildState *) state;
+
+	if (buildstate == NULL)
+		elog(ERROR, "bwtree: build callback requires state");
+	if (buildstate->indexrel != index)
+		elog(ERROR, "bwtree: build callback relation mismatch");
+
+	if (!tupleIsAlive)
+		return;
+
+	bwtreeinsert(index, values, isnull, tid, NULL,
+				 UNIQUE_CHECK_NO, false, buildstate->indexInfo);
+	buildstate->indtuples += 1;
+}
+
 IndexBuildResult *
 bwtreebuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-	(void) heap;
-	(void) index;
-	(void) indexInfo;
+	IndexBuildResult *result;
+	BWTreeBuildState buildstate;
+	double		reltuples;
 
-	elog(ERROR, "bwtree: build interface not implemented yet; buildempty path only is currently supported");
-	return NULL;
+	if (RelationGetNumberOfBlocks(index) != 0)
+		elog(ERROR, "index \"%s\" already contains data",
+			 RelationGetRelationName(index));
+
+	_bwt_build_empty_mainfork(index);
+
+	buildstate.indexrel = index;
+	buildstate.indexInfo = indexInfo;
+	buildstate.indtuples = 0;
+	reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
+									   _bwt_build_insert_callback,
+									   (void *) &buildstate, NULL);
+
+	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
+	result->heap_tuples = reltuples;
+	result->index_tuples = buildstate.indtuples;
+	return result;
 }
 
 void
@@ -108,8 +151,13 @@ bwtreebuildempty(Relation index)
 char *
 bwtreebuildphasename(int64 phasenum)
 {
-	(void) phasenum;
-
-	elog(ERROR, "bwtree: buildphasename interface defined but implementation not written yet");
-	return NULL;
+	switch (phasenum)
+	{
+		case 0:
+			return "initializing";
+		case 1:
+			return "loading tuples";
+		default:
+			return "building";
+	}
 }

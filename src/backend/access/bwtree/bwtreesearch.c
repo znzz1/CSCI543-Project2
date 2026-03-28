@@ -8,35 +8,71 @@
 #include "postgres.h"
 
 #include "access/bwtree.h"
+#include "access/nbtree.h"
+#include "miscadmin.h"
+
+/*
+ * Safety bound that prevents infinite loops when metadata is corrupt
+ * (e.g., internal-node downlink cycles).
+ */
+#define BWTREE_MAX_DESCEND_STEPS	1024
+
+static int32 _bwt_compare_tuple(Relation rel, ScanKey scankey, int nkeys,
+								IndexTuple itup);
+static BWTreePid _bwt_choose_child_pid(Relation rel, ScanKey scankey, int nkeys,
+									   const BWTreeNodeView *view);
+static bool _bwt_should_move_right(Relation rel, ScanKey scankey, int nkeys,
+								   const BWTreeNodeView *view);
+static void _bwt_validate_right_sibling(Relation rel, BWTreeMetaPageData *metad,
+										const BWTreeNodeView *view,
+										BWTreePid right_pid);
+static void _bwt_validate_child_link(Relation rel, BWTreeMetaPageData *metad,
+									 const BWTreeNodeView *parent_view,
+									 BWTreePid child_pid);
+static void _bwt_push_pid(BWTreeContext *ctx, BWTreePid pid);
 
 void
 _bwt_begin_traverse(BWTreeContext *ctx, MemoryContext memcxt)
 {
-	(void) ctx;
-	(void) memcxt;
+	if (ctx == NULL)
+		elog(ERROR, "bwtree: begin-traverse requires a valid context");
 
-	elog(ERROR, "bwtree: begin-traverse interface defined but implementation not written yet");
+	memset(ctx->stack_pid, 0xFF, sizeof(ctx->stack_pid));
+	ctx->depth = 0;
+	ctx->memcxt = (memcxt != NULL) ? memcxt : CurrentMemoryContext;
 }
 
 void
 _bwt_finish_traverse(BWTreeContext *ctx)
 {
-	(void) ctx;
+	if (ctx == NULL)
+		return;
 
-	elog(ERROR, "bwtree: finish-traverse interface defined but implementation not written yet");
+	memset(ctx->stack_pid, 0xFF, sizeof(ctx->stack_pid));
+	ctx->depth = 0;
+	ctx->memcxt = NULL;
 }
 
 BWTreePid
 _bwt_search_leaf(Relation rel, BWTreeMetaPageData *metad,
 				  ScanKey scankey, int nkeys)
 {
-	(void) rel;
-	(void) metad;
-	(void) scankey;
-	(void) nkeys;
+	BWTreeContext		ctx;
+	BWTreeNodeSnapshot	leaf_snapshot;
+	bool				found;
 
-	elog(ERROR, "bwtree: search-leaf interface defined but implementation not written yet");
-	return InvalidBWTreePid;
+	if (metad == NULL)
+		elog(ERROR, "bwtree: search-leaf requires valid metapage data");
+
+	_bwt_begin_traverse(&ctx, CurrentMemoryContext);
+	found = _bwt_descend_to_leaf(rel, metad, scankey, nkeys, &ctx,
+								 &leaf_snapshot);
+	_bwt_finish_traverse(&ctx);
+
+	if (!found)
+		return InvalidBWTreePid;
+
+	return leaf_snapshot.pid;
 }
 
 BWTreePid
@@ -44,14 +80,27 @@ _bwt_search_leaf_with_parent(Relation rel, BWTreeMetaPageData *metad,
 							 ScanKey scankey, int nkeys,
 							 BWTreePid *parent_pid)
 {
-	(void) rel;
-	(void) metad;
-	(void) scankey;
-	(void) nkeys;
-	(void) parent_pid;
+	BWTreeContext		ctx;
+	BWTreeNodeSnapshot	leaf_snapshot;
+	bool				found;
 
-	elog(ERROR, "bwtree: search-leaf-with-parent interface defined but implementation not written yet");
-	return InvalidBWTreePid;
+	if (metad == NULL)
+		elog(ERROR, "bwtree: search-leaf-with-parent requires valid metapage data");
+
+	if (parent_pid != NULL)
+		*parent_pid = InvalidBWTreePid;
+
+	_bwt_begin_traverse(&ctx, CurrentMemoryContext);
+	found = _bwt_descend_to_leaf(rel, metad, scankey, nkeys, &ctx,
+								 &leaf_snapshot);
+	if (found && parent_pid != NULL && ctx.depth >= 2)
+		*parent_pid = ctx.stack_pid[ctx.depth - 2];
+	_bwt_finish_traverse(&ctx);
+
+	if (!found)
+		return InvalidBWTreePid;
+
+	return leaf_snapshot.pid;
 }
 
 bool
@@ -60,14 +109,67 @@ _bwt_descend_to_leaf(Relation rel, BWTreeMetaPageData *metad,
 					 BWTreeContext *ctx,
 					 BWTreeNodeSnapshot *leaf_snapshot)
 {
-	(void) rel;
-	(void) metad;
-	(void) scankey;
-	(void) nkeys;
-	(void) ctx;
-	(void) leaf_snapshot;
+	BWTreePid	cur_pid;
+	int			step;
 
-	elog(ERROR, "bwtree: descend-to-leaf interface defined but implementation not written yet");
+	if (metad == NULL)
+		elog(ERROR, "bwtree: descend-to-leaf requires valid metapage data");
+	if (ctx == NULL)
+		elog(ERROR, "bwtree: descend-to-leaf requires valid traversal context");
+	if (leaf_snapshot == NULL)
+		elog(ERROR, "bwtree: descend-to-leaf requires output snapshot");
+
+	/*
+	 * Always start from a clean traversal stack so callers never observe
+	 * stale path entries from a previous descent.
+	 */
+	_bwt_begin_traverse(ctx,
+						(ctx->memcxt != NULL) ? ctx->memcxt : CurrentMemoryContext);
+
+	cur_pid = metad->bwt_root_pid;
+	if (cur_pid == InvalidBWTreePid)
+		return false;
+
+	for (step = 0; step < BWTREE_MAX_DESCEND_STEPS; step++)
+	{
+		BWTreeNodeView	view;
+		BWTreePid		next_pid;
+
+		CHECK_FOR_INTERRUPTS();
+		_bwt_materialize_node(rel, metad, cur_pid, &view);
+
+		/*
+		 * Correctness-first split routing:
+		 *
+		 * If a split delta exists and key belongs to the right half, move to
+		 * split_right_pid before recording this level in traversal stack.
+		 * This approximates "move-right" semantics even while full SMO
+		 * publication protocol is still under construction.
+		 */
+		if (_bwt_should_move_right(rel, scankey, nkeys, &view))
+		{
+			_bwt_validate_right_sibling(rel, metad, &view, view.split_right_pid);
+			cur_pid = view.split_right_pid;
+			_bwt_free_node_view(&view);
+			continue;
+		}
+
+		_bwt_push_pid(ctx, cur_pid);
+
+		if (view.snapshot.is_leaf)
+		{
+			*leaf_snapshot = view.snapshot;
+			_bwt_free_node_view(&view);
+			return true;
+		}
+
+		next_pid = _bwt_choose_child_pid(rel, scankey, nkeys, &view);
+		_bwt_validate_child_link(rel, metad, &view, next_pid);
+		cur_pid = next_pid;
+		_bwt_free_node_view(&view);
+	}
+
+	elog(ERROR, "bwtree: descend-to-leaf exceeded max steps (possible routing cycle)");
 	return false;
 }
 
@@ -75,12 +177,255 @@ int32
 _bwt_compare(Relation rel, ScanKey scankey, int nkeys,
 			 Page page, OffsetNumber offnum)
 {
-	(void) rel;
-	(void) scankey;
-	(void) nkeys;
-	(void) page;
-	(void) offnum;
+	OffsetNumber	maxoff;
+	ItemId			itemid;
+	IndexTuple		itup;
+	BWTreePageOpaque opaque;
 
-	elog(ERROR, "bwtree: compare interface defined but implementation not written yet");
+	if (page == NULL)
+		elog(ERROR, "bwtree: compare requires a valid page");
+	if (offnum < FirstOffsetNumber)
+		elog(ERROR, "bwtree: compare offset %u is invalid",
+			 (unsigned int) offnum);
+
+	opaque = BWTreePageGetOpaque(page);
+	if (opaque->bwto_page_id != BWTREE_PAGE_ID)
+		elog(ERROR, "bwtree: compare target page has invalid page id");
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (offnum > maxoff)
+		elog(ERROR, "bwtree: compare offset %u exceeds max offset %u",
+			 (unsigned int) offnum, (unsigned int) maxoff);
+
+	itemid = PageGetItemId(page, offnum);
+	if (!ItemIdIsUsed(itemid))
+		elog(ERROR, "bwtree: compare target offset %u is unused",
+			 (unsigned int) offnum);
+
+	itup = (IndexTuple) PageGetItem(page, itemid);
+	return _bwt_compare_tuple(rel, scankey, nkeys, itup);
+}
+
+static int32
+_bwt_compare_tuple(Relation rel, ScanKey scankey, int nkeys, IndexTuple itup)
+{
+	TupleDesc	itupdesc;
+	int			i;
+
+	if (rel == NULL)
+		elog(ERROR, "bwtree: compare requires a valid relation");
+	if (itup == NULL)
+		elog(ERROR, "bwtree: compare requires a valid index tuple");
+
+	if (scankey == NULL || nkeys <= 0)
+		return 0;
+
+	itupdesc = RelationGetDescr(rel);
+
+	for (i = 0; i < nkeys; i++)
+	{
+		ScanKey		key = &scankey[i];
+		Datum		datum;
+		bool		isNull;
+		int32		result;
+
+		if (key->sk_attno <= 0)
+			elog(ERROR, "bwtree: scankey[%d] has invalid attno %d",
+				 i, key->sk_attno);
+		if (key->sk_attno > itupdesc->natts)
+			elog(ERROR, "bwtree: scankey[%d] attno %d exceeds index natts %d",
+				 i, key->sk_attno, itupdesc->natts);
+
+		datum = index_getattr(itup, key->sk_attno, itupdesc, &isNull);
+
+		if (key->sk_flags & SK_ISNULL)
+		{
+			if (isNull)
+				result = 0;
+			else if (key->sk_flags & SK_BT_NULLS_FIRST)
+				result = -1;
+			else
+				result = 1;
+		}
+		else if (isNull)
+		{
+			if (key->sk_flags & SK_BT_NULLS_FIRST)
+				result = 1;
+			else
+				result = -1;
+		}
+		else
+		{
+			/*
+			 * sk_func is called as (tuple_key, scan_argument).  We invert the
+			 * sign in ASC order so return value semantics stay:
+			 *   <0 => scankey < tuple
+			 *    0 => equal
+			 *   >0 => scankey > tuple
+			 */
+			result = DatumGetInt32(FunctionCall2Coll(&key->sk_func,
+													 key->sk_collation,
+													 datum,
+													 key->sk_argument));
+			if (!(key->sk_flags & SK_BT_DESC))
+			{
+				if (result > 0)
+					result = -1;
+				else if (result < 0)
+					result = 1;
+			}
+		}
+
+		if (result != 0)
+			return result;
+	}
+
 	return 0;
+}
+
+static bool
+_bwt_should_move_right(Relation rel, ScanKey scankey, int nkeys,
+					   const BWTreeNodeView *view)
+{
+	if (view == NULL)
+		return false;
+	if (view->state != BWT_STATE_SPLIT_PENDING)
+		return false;
+	if (view->split_separator == NULL || view->split_right_pid == InvalidBWTreePid)
+		return false;
+	if (scankey == NULL || nkeys <= 0)
+		return false;
+
+	return (_bwt_compare_tuple(rel, scankey, nkeys, view->split_separator) >= 0);
+}
+
+static void
+_bwt_validate_right_sibling(Relation rel, BWTreeMetaPageData *metad,
+							const BWTreeNodeView *view,
+							BWTreePid right_pid)
+{
+	BWTreeNodeSnapshot	right_snapshot;
+
+	if (view == NULL || metad == NULL)
+		elog(ERROR, "bwtree: validate-right-sibling requires valid inputs");
+	if (right_pid == InvalidBWTreePid || right_pid >= metad->bwt_next_pid)
+		elog(ERROR, "bwtree: invalid split right PID %u from PID %u",
+			 (unsigned int) right_pid,
+			 (unsigned int) ((view != NULL) ? view->snapshot.pid : InvalidBWTreePid));
+	if (right_pid == view->snapshot.pid)
+		elog(ERROR, "bwtree: split right PID equals source PID %u",
+			 (unsigned int) right_pid);
+	if (!_bwt_capture_node_snapshot(rel, metad, right_pid, &right_snapshot))
+		elog(ERROR, "bwtree: split right PID %u is not mapped",
+			 (unsigned int) right_pid);
+	if (right_snapshot.level != view->snapshot.level)
+		elog(ERROR, "bwtree: split sibling level mismatch: left level %u right level %u",
+			 (unsigned int) view->snapshot.level,
+			 (unsigned int) right_snapshot.level);
+	if (right_snapshot.is_leaf != view->snapshot.is_leaf)
+		elog(ERROR, "bwtree: split sibling leaf flag mismatch for PID %u -> %u",
+			 (unsigned int) view->snapshot.pid,
+			 (unsigned int) right_pid);
+}
+
+static void
+_bwt_validate_child_link(Relation rel, BWTreeMetaPageData *metad,
+						 const BWTreeNodeView *parent_view,
+						 BWTreePid child_pid)
+{
+	BWTreeNodeSnapshot	child_snapshot;
+
+	if (parent_view == NULL || metad == NULL)
+		elog(ERROR, "bwtree: validate-child-link requires valid inputs");
+	if (child_pid == InvalidBWTreePid || child_pid >= metad->bwt_next_pid)
+		elog(ERROR, "bwtree: internal PID %u chose invalid child PID %u",
+			 (unsigned int) parent_view->snapshot.pid,
+			 (unsigned int) child_pid);
+	if (!_bwt_capture_node_snapshot(rel, metad, child_pid, &child_snapshot))
+		elog(ERROR, "bwtree: internal PID %u child PID %u is not mapped",
+			 (unsigned int) parent_view->snapshot.pid,
+			 (unsigned int) child_pid);
+	if (parent_view->snapshot.level == 0)
+		elog(ERROR, "bwtree: internal PID %u has invalid level 0",
+			 (unsigned int) parent_view->snapshot.pid);
+	if (child_snapshot.level + 1 != parent_view->snapshot.level)
+		elog(ERROR, "bwtree: level mismatch parent PID %u (L%u) child PID %u (L%u)",
+			 (unsigned int) parent_view->snapshot.pid,
+			 (unsigned int) parent_view->snapshot.level,
+			 (unsigned int) child_pid,
+			 (unsigned int) child_snapshot.level);
+}
+
+static BWTreePid
+_bwt_choose_child_pid(Relation rel, ScanKey scankey, int nkeys,
+					  const BWTreeNodeView *view)
+{
+	BWTreePid	child_pid = InvalidBWTreePid;
+	int			i;
+
+	if (view == NULL)
+		elog(ERROR, "bwtree: choose-child requires a valid node view");
+	if (view->snapshot.is_leaf)
+		elog(ERROR, "bwtree: choose-child called on leaf PID %u",
+			 (unsigned int) view->snapshot.pid);
+	if (view->page.nitems <= 0 || view->page.items == NULL)
+		elog(ERROR, "bwtree: internal PID %u has no downlink tuples",
+			 (unsigned int) view->snapshot.pid);
+
+	/* No key means leftmost descent. */
+	if (scankey == NULL || nkeys <= 0)
+	{
+		child_pid = BWTreeTupleGetDownLink(view->page.items[0]);
+		if (child_pid == InvalidBWTreePid)
+			elog(ERROR, "bwtree: internal PID %u has invalid leftmost downlink",
+				 (unsigned int) view->snapshot.pid);
+		return child_pid;
+	}
+
+	for (i = 0; i < view->page.nitems; i++)
+	{
+		IndexTuple	itup = view->page.items[i];
+		BWTreePid	downlink;
+		int32		cmp;
+
+		if (itup == NULL)
+			elog(ERROR, "bwtree: internal PID %u has NULL tuple at slot %d",
+				 (unsigned int) view->snapshot.pid, i);
+
+		downlink = BWTreeTupleGetDownLink(itup);
+		if (downlink == InvalidBWTreePid)
+			elog(ERROR, "bwtree: internal PID %u has invalid downlink at slot %d",
+				 (unsigned int) view->snapshot.pid, i);
+
+		cmp = _bwt_compare_tuple(rel, scankey, nkeys, itup);
+		if (cmp < 0)
+			break;
+
+		child_pid = downlink;
+	}
+
+	if (child_pid == InvalidBWTreePid)
+	{
+		child_pid = BWTreeTupleGetDownLink(view->page.items[0]);
+		if (child_pid == InvalidBWTreePid)
+			elog(ERROR, "bwtree: internal PID %u has invalid fallback downlink",
+				 (unsigned int) view->snapshot.pid);
+	}
+
+	return child_pid;
+}
+
+static void
+_bwt_push_pid(BWTreeContext *ctx, BWTreePid pid)
+{
+	int max_depth;
+
+	if (ctx == NULL)
+		elog(ERROR, "bwtree: push-pid requires a valid traversal context");
+
+	max_depth = (int) lengthof(ctx->stack_pid);
+	if (ctx->depth < 0 || ctx->depth >= max_depth)
+		elog(ERROR, "bwtree: traversal stack overflow at depth %d", ctx->depth);
+
+	ctx->stack_pid[ctx->depth++] = pid;
 }

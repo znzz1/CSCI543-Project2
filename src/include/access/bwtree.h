@@ -285,7 +285,7 @@ extern char *bwtreebuildphasename(int64 phasenum);
 
 /* --- bwtreepage.c ------------------------------------------------ */
 extern Buffer _bwt_getbuf(Relation rel, BlockNumber blkno, int access);
-extern void _bwt_relbuf(Relation rel, Buffer buf);
+extern void _bwt_relbuf(Relation rel, Buffer buf, int access);
 extern Buffer _bwt_allocbuf(Relation rel);
 extern void _bwt_initpage(Page page, uint16 flags, BWTreePid pid, uint32 level);
 extern void _bwt_initmetapage(Page page, BWTreePid root_pid, uint32 level);
@@ -298,10 +298,12 @@ extern void _bwt_map_update(Relation rel, BWTreeMetaPageData *metad,
 							BWTreePid pid,
 							BlockNumber base_blkno, BlockNumber delta_blkno);
 extern BWTreePid _bwt_map_alloc_pid(Relation rel, BWTreeMetaPageData *metad,
+									Buffer metabuf,
 									BlockNumber base_blkno,
 									BlockNumber delta_blkno);
 extern BlockNumber _bwt_map_ensure_page(Relation rel,
 										BWTreeMetaPageData *metad,
+										Buffer metabuf,
 										int map_page_idx);
 
 /* --- bwtreedelta.c ----------------------------------------------- */
@@ -309,11 +311,16 @@ extern BWTreeNodeKind _bwt_classify_node(Page page);
 extern void _bwt_delta_install(Relation rel, BWTreeMetaPageData *metad,
 							   BWTreePid pid, BWTreeDeltaType type,
 							   IndexTuple itup, BWTreePid related_pid);
+/* base_page must be a writable copy; this function applies deltas in place. */
 extern int _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
 							Page base_page, OffsetNumber *maxoff);
 extern bool _bwt_capture_node_snapshot(Relation rel, BWTreeMetaPageData *metad,
 									   BWTreePid pid,
 									   BWTreeNodeSnapshot *snapshot);
+/*
+ * In the current correctness-first stage, basebuf_out is always set to
+ * InvalidBuffer by the implementation.
+ */
 extern void _bwt_materialize_page(Relation rel, BWTreeMetaPageData *metad,
 								  BWTreePid pid, Buffer *basebuf_out,
 								  BWTMaterializedPage *mpage);
@@ -341,6 +348,7 @@ extern int32 _bwt_compare(Relation rel, ScanKey scankey, int nkeys,
 /* --- bwtreedelta.c ----------------------------------------------- */
 extern void _bwt_consolidate(Relation rel, BWTreeMetaPageData *metad,
 							 BWTreePid pid);
+/* Consolidation is intentionally disabled for now (correctness-first mode). */
 extern bool _bwt_should_consolidate(Relation rel, BWTreeMetaPageData *metad,
 									BWTreePid pid);
 

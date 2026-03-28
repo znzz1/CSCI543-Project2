@@ -29,11 +29,16 @@ _bwt_map_ensure_page(Relation rel, BWTreeMetaPageData *metad, Buffer metabuf,
 	Buffer	buf;
 	Page	page;
 
-	Assert(map_page_idx >= 0);
-	Assert(map_page_idx < BWTREE_MAX_MAP_PAGES);
+	if (map_page_idx < 0 || map_page_idx >= BWTREE_MAX_MAP_PAGES)
+		elog(ERROR, "bwtree: mapping page index %d is out of range", map_page_idx);
 
 	if (map_page_idx < (int) metad->bwt_num_map_pages)
+	{
+		if (!BlockNumberIsValid(metad->bwt_map_blknos[map_page_idx]))
+			elog(ERROR, "bwtree: mapping page %d has invalid block number",
+				 map_page_idx);
 		return metad->bwt_map_blknos[map_page_idx];
+	}
 
 	buf = _bwt_allocbuf(rel);
 	page = BufferGetPage(buf);
@@ -59,6 +64,9 @@ _bwt_map_lookup(Relation rel, BWTreeMetaPageData *metad, BWTreePid pid,
 	Page			page;
 	BWTreeMapEntry *entries;
 
+	if (base_blkno == NULL || delta_blkno == NULL)
+		elog(ERROR, "bwtree: map lookup output pointers must not be NULL");
+
 	if (pid >= metad->bwt_next_pid)
 		return false;
 
@@ -69,6 +77,10 @@ _bwt_map_lookup(Relation rel, BWTreeMetaPageData *metad, BWTreePid pid,
 		return false;
 
 	map_blkno = metad->bwt_map_blknos[map_page_idx];
+	if (!BlockNumberIsValid(map_blkno))
+		elog(ERROR, "bwtree: PID %u maps to invalid mapping page block",
+			 (unsigned int) pid);
+
 	buf = _bwt_getbuf(rel, map_blkno, BWT_READ);
 	page = BufferGetPage(buf);
 	entries = BWTreeMapPageGetEntries(page);
@@ -91,11 +103,28 @@ _bwt_map_update(Relation rel, BWTreeMetaPageData *metad, BWTreePid pid,
 	Page			page;
 	BWTreeMapEntry *entries;
 
+	if (pid >= metad->bwt_next_pid)
+		elog(ERROR, "bwtree: cannot update unmapped PID %u",
+			 (unsigned int) pid);
+
 	map_page_idx = pid / BWTREE_MAP_ENTRIES_PER_PAGE;
 	entry_idx = pid % BWTREE_MAP_ENTRIES_PER_PAGE;
-	Assert(map_page_idx < (int) metad->bwt_num_map_pages);
+	if (map_page_idx >= (int) metad->bwt_num_map_pages)
+		elog(ERROR, "bwtree: PID %u map page %d does not exist",
+			 (unsigned int) pid, map_page_idx);
 
 	map_blkno = metad->bwt_map_blknos[map_page_idx];
+	if (!BlockNumberIsValid(map_blkno))
+		elog(ERROR, "bwtree: map page %d has invalid block number",
+			 map_page_idx);
+
+	/*
+	 * Correctness-first trade-off:
+	 *
+	 * We serialize mapping entry updates with a mapping-page write latch.
+	 * This is simpler and safer for now than a lock-free CAS publish path,
+	 * but it reduces concurrency for PIDs that share the same mapping page.
+	 */
 	buf = _bwt_getbuf(rel, map_blkno, BWT_WRITE);
 	page = BufferGetPage(buf);
 	entries = BWTreeMapPageGetEntries(page);
@@ -120,10 +149,18 @@ _bwt_map_alloc_pid(Relation rel, BWTreeMetaPageData *metad,
 	Page			page;
 	BWTreeMapEntry *entries;
 
-	pid = metad->bwt_next_pid++;
-	MarkBufferDirty(metabuf);
+	if (metad->bwt_next_pid == InvalidBWTreePid)
+		elog(ERROR, "bwtree: PID space exhausted");
+
+	pid = metad->bwt_next_pid;
 	map_page_idx = pid / BWTREE_MAP_ENTRIES_PER_PAGE;
+	if (map_page_idx >= BWTREE_MAX_MAP_PAGES)
+		elog(ERROR, "bwtree: mapping table is full at PID %u",
+			 (unsigned int) pid);
+
 	entry_idx = pid % BWTREE_MAP_ENTRIES_PER_PAGE;
+	metad->bwt_next_pid = pid + 1;
+	MarkBufferDirty(metabuf);
 
 	map_blkno = _bwt_map_ensure_page(rel, metad, metabuf, map_page_idx);
 	buf = _bwt_getbuf(rel, map_blkno, BWT_WRITE);
