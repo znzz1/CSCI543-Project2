@@ -18,6 +18,7 @@
 #include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
+#include "access/bwtree.h"
 #include "access/subtrans.h"
 #include "access/syncscan.h"
 #include "access/transam.h"
@@ -146,6 +147,8 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, PgArchShmemSize());
 	size = add_size(size, ApplyLauncherShmemSize());
 	size = add_size(size, BTreeShmemSize());
+	size = add_size(size, BwTreeEpochShmemSize());
+	size = add_size(size, BwTreeGCShmemSize());
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
 	size = add_size(size, StatsShmemSize());
@@ -352,6 +355,8 @@ CreateOrAttachShmemStructs(void)
 	 * Set up other modules that need some shared memory space
 	 */
 	BTreeShmemInit();
+	BwTreeEpochShmemInit();
+	BwTreeGCShmemInit();
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();

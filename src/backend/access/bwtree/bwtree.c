@@ -1,10 +1,3 @@
-/*-------------------------------------------------------------------------
- *
- * bwtree.c
- *    AM handler and vacuum callbacks for the Bw-tree index.
- *
- *-------------------------------------------------------------------------
- */
 #include "postgres.h"
 
 #include "access/bwtree.h"
@@ -80,18 +73,18 @@ bwtreebulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	(void) callback;
 	(void) callback_state;
 
-	/*
-	 * Correctness-first / no-GC build:
-	 *
-	 * We currently don't physically remove dead index tuples in VACUUM path.
-	 * Return stable stats so VACUUM can proceed without touching Bw-tree
-	 * contents.
-	 */
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
+	/*
+	 * Project scope alignment:
+	 * delete/vacuum tuple pruning is intentionally out of scope.
+	 */
 	if (info != NULL && info->index != NULL)
+	{
 		stats->num_pages = RelationGetNumberOfBlocks(info->index);
+		_bwt_gc_maybe_run(info->index);
+	}
 
 	return stats;
 }
@@ -106,7 +99,10 @@ bwtreevacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
 	if (info != NULL && info->index != NULL)
+	{
 		stats->num_pages = RelationGetNumberOfBlocks(info->index);
+		_bwt_gc_maybe_run(info->index);
+	}
 
 	return stats;
 }

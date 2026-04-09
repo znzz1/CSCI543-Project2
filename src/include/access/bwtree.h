@@ -49,12 +49,17 @@
 #define BWT_DELETED         (1 << 2)
 #define BWT_META            (1 << 3)
 #define BWT_DELTA           (1 << 4)
+#define BWT_SPLIT_PENDING   (1 << 5)
 
 /* AM support procedure numbers (reuse btree strategies) */
 #define BWTORDER_PROC       1
 #define BWTNProcs           1
 
-#define BWTREE_DELTA_CHAIN_THRESHOLD    1
+/*
+ * Correctness-first + practical performance balance:
+ * avoid consolidating on every single delta install.
+ */
+#define BWTREE_DELTA_CHAIN_THRESHOLD    128
 #define BWTREE_MAX_MAP_PAGES            200
 
 /* ----------------------------------------------------------------
@@ -221,6 +226,7 @@ typedef struct BWTreeNodeSnapshot
 	BlockNumber	base_blkno;
 	BlockNumber	delta_blkno;
 	uint32		level;
+	uint16		flags;
 	bool		is_leaf;
 	bool		is_root;
 } BWTreeNodeSnapshot;
@@ -241,6 +247,21 @@ typedef struct BWTreeContext
 	int			depth;
 	MemoryContext memcxt;
 } BWTreeContext;
+
+typedef enum BWTreeGCRetireKind
+{
+	BWT_GC_RETIRE_DELTA_CHAIN,
+	BWT_GC_RETIRE_PID,
+	BWT_GC_RETIRE_BLOCK
+} BWTreeGCRetireKind;
+
+typedef struct BWTreeGCRetireObject
+{
+	BWTreeGCRetireKind	kind;
+	Oid					relid;
+	BWTreePid			pid;
+	BlockNumber			head_blkno;
+} BWTreeGCRetireObject;
 
 /* ================================================================
  *  PUBLIC AM CALLBACKS
@@ -278,6 +299,10 @@ extern bool bwtreevalidate(Oid opclassoid);
 extern void bwtreeadjustmembers(Oid opfamilyoid, Oid opclassoid,
 								List *operators, List *functions);
 extern char *bwtreebuildphasename(int64 phasenum);
+extern Size BwTreeEpochShmemSize(void);
+extern void BwTreeEpochShmemInit(void);
+extern Size BwTreeGCShmemSize(void);
+extern void BwTreeGCShmemInit(void);
 
 /* ================================================================
  *  INTERNAL FUNCTIONS
@@ -297,6 +322,14 @@ extern bool _bwt_map_lookup(Relation rel, BWTreeMetaPageData *metad,
 extern void _bwt_map_update(Relation rel, BWTreeMetaPageData *metad,
 							BWTreePid pid,
 							BlockNumber base_blkno, BlockNumber delta_blkno);
+extern bool _bwt_map_cas(Relation rel, BWTreeMetaPageData *metad,
+						 BWTreePid pid,
+						 BlockNumber expected_base_blkno,
+						 BlockNumber expected_delta_blkno,
+						 BlockNumber new_base_blkno,
+						 BlockNumber new_delta_blkno,
+						 BlockNumber *observed_base_blkno,
+						 BlockNumber *observed_delta_blkno);
 extern BWTreePid _bwt_map_alloc_pid(Relation rel, BWTreeMetaPageData *metad,
 									Buffer metabuf,
 									BlockNumber base_blkno,
@@ -305,6 +338,33 @@ extern BlockNumber _bwt_map_ensure_page(Relation rel,
 										BWTreeMetaPageData *metad,
 										Buffer metabuf,
 										int map_page_idx);
+
+/* --- bwtreeepoch.c ----------------------------------------------- */
+extern void _bwt_epoch_backend_init(void);
+extern void _bwt_epoch_backend_fini(void);
+extern uint64 _bwt_epoch_enter(void);
+extern void _bwt_epoch_exit(void);
+extern uint64 _bwt_epoch_current(void);
+extern void _bwt_epoch_try_advance(void);
+extern uint64 _bwt_epoch_min_active(void);
+extern bool _bwt_epoch_can_reclaim(uint64 retire_epoch);
+
+/* --- bwtreegc.c -------------------------------------------------- */
+extern void _bwt_gc_init(void);
+extern void _bwt_gc_fini(void);
+extern void _bwt_gc_retire_object(Relation rel,
+								  const BWTreeGCRetireObject *obj,
+								  uint64 retire_epoch);
+extern void _bwt_gc_retire_delta_chain(Relation rel, BWTreePid pid,
+									   BlockNumber old_delta_head,
+									   uint64 retire_epoch);
+extern void _bwt_gc_retire_pid(Relation rel, BWTreePid pid,
+							   uint64 retire_epoch);
+extern void _bwt_gc_retire_block(Relation rel, BlockNumber blkno,
+								 uint64 retire_epoch);
+extern int _bwt_gc_try_reclaim(Relation rel, int budget);
+extern void _bwt_gc_maybe_run(Relation rel);
+extern uint64 _bwt_gc_pending_count(Relation rel);
 
 /* --- bwtreedelta.c ----------------------------------------------- */
 extern BWTreeNodeKind _bwt_classify_node(Page page);
@@ -348,7 +408,6 @@ extern int32 _bwt_compare(Relation rel, ScanKey scankey, int nkeys,
 /* --- bwtreedelta.c ----------------------------------------------- */
 extern void _bwt_consolidate(Relation rel, BWTreeMetaPageData *metad,
 							 BWTreePid pid);
-/* Consolidation is intentionally disabled for now (correctness-first mode). */
 extern bool _bwt_should_consolidate(Relation rel, BWTreeMetaPageData *metad,
 									BWTreePid pid);
 

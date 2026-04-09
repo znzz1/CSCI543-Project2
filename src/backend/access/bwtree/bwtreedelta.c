@@ -1,19 +1,77 @@
-/*-------------------------------------------------------------------------
- *
- * bwtreedelta.c
- *    Delta/materialization skeletons for the Bw-tree.
- *
- *-------------------------------------------------------------------------
- */
 #include "postgres.h"
 
 #include "access/bwtree.h"
+#include "storage/indexfsm.h"
 #include "storage/bufpage.h"
 
 typedef struct BWTreeDeltaApplyEntry
 {
 	BWTreeDeltaRecordData *drec;
 } BWTreeDeltaApplyEntry;
+
+static bool
+_bwt_relink_neighbors_on_base_swap(Relation rel,
+								   BlockNumber old_base_blkno,
+								   BlockNumber new_base_blkno,
+								   BlockNumber prev_blkno,
+								   BlockNumber next_blkno)
+{
+	bool old_detached = true;
+
+	if (!BlockNumberIsValid(old_base_blkno) ||
+		!BlockNumberIsValid(new_base_blkno))
+		return false;
+
+	if (BlockNumberIsValid(prev_blkno))
+	{
+		Buffer			prevbuf;
+		Page			prevpage;
+		BWTreePageOpaque prev_opaque;
+
+		prevbuf = _bwt_getbuf(rel, prev_blkno, BWT_WRITE);
+		prevpage = BufferGetPage(prevbuf);
+		prev_opaque = BWTreePageGetOpaque(prevpage);
+
+		if (prev_opaque->bwto_page_id != BWTREE_PAGE_ID ||
+			BWTreePageIsDelta(prev_opaque))
+			old_detached = false;
+		else if (prev_opaque->bwto_next == old_base_blkno)
+		{
+			prev_opaque->bwto_next = new_base_blkno;
+			MarkBufferDirty(prevbuf);
+		}
+		else if (prev_opaque->bwto_next != new_base_blkno)
+			old_detached = false;
+
+		_bwt_relbuf(rel, prevbuf, BWT_WRITE);
+	}
+
+	if (BlockNumberIsValid(next_blkno))
+	{
+		Buffer			nextbuf;
+		Page			nextpage;
+		BWTreePageOpaque next_opaque;
+
+		nextbuf = _bwt_getbuf(rel, next_blkno, BWT_WRITE);
+		nextpage = BufferGetPage(nextbuf);
+		next_opaque = BWTreePageGetOpaque(nextpage);
+
+		if (next_opaque->bwto_page_id != BWTREE_PAGE_ID ||
+			BWTreePageIsDelta(next_opaque))
+			old_detached = false;
+		else if (next_opaque->bwto_prev == old_base_blkno)
+		{
+			next_opaque->bwto_prev = new_base_blkno;
+			MarkBufferDirty(nextbuf);
+		}
+		else if (next_opaque->bwto_prev != new_base_blkno)
+			old_detached = false;
+
+		_bwt_relbuf(rel, nextbuf, BWT_WRITE);
+	}
+
+	return old_detached;
+}
 
 static bool
 _bwt_delete_tid_from_page(Page page, const ItemPointerData *target_tid)
@@ -178,69 +236,15 @@ _bwt_delta_install(Relation rel, BWTreeMetaPageData *metad,
 				   BWTreePid pid, BWTreeDeltaType type,
 				   IndexTuple itup, BWTreePid related_pid)
 {
-	int				map_page_idx;
-	int				entry_idx;
-	BlockNumber		map_blkno;
-	Buffer			mapbuf;
-	Page			mappage;
-	BWTreeMapEntry *entries;
-	BlockNumber		base_blkno;
-	BlockNumber		old_delta_blkno;
-	Buffer			basebuf;
-	Page			basepage;
-	BWTreePageOpaque base_opaque;
-	Buffer			deltabuf;
-	Page			deltapage;
-	BWTreePageOpaque delta_opaque;
+	Size				data_len;
+	Size				item_size;
+	char			   *item_data;
 	BWTreeDeltaRecordData *drec;
-	char		   *item_data;
-	Size			data_len;
-	Size			item_size;
-	OffsetNumber	offnum;
-	uint16			flags = BWT_DELTA;
+	int					retry_guard = 0;
 
 	if (pid >= metad->bwt_next_pid)
 		elog(ERROR, "bwtree: cannot install delta on unknown PID %u",
 			 (unsigned int) pid);
-
-	map_page_idx = pid / BWTREE_MAP_ENTRIES_PER_PAGE;
-	entry_idx = pid % BWTREE_MAP_ENTRIES_PER_PAGE;
-	if (map_page_idx >= (int) metad->bwt_num_map_pages)
-		elog(ERROR, "bwtree: PID %u map page %d does not exist",
-			 (unsigned int) pid, map_page_idx);
-
-	map_blkno = metad->bwt_map_blknos[map_page_idx];
-	if (!BlockNumberIsValid(map_blkno))
-		elog(ERROR, "bwtree: map page %d has invalid block number",
-			 map_page_idx);
-
-	/*
-	 * Hold the mapping entry write lock while reading old delta head and
-	 * publishing the new head, so concurrent installers cannot overwrite each
-	 * other's link updates.
-	 *
-	 * Correctness-first trade-off:
-	 *   Use coarse mapping-page latches instead of lock-free CAS publish.
-	 *   This is simpler/safer now, but lowers update concurrency.
-	 */
-	mapbuf = _bwt_getbuf(rel, map_blkno, BWT_WRITE);
-	mappage = BufferGetPage(mapbuf);
-	entries = BWTreeMapPageGetEntries(mappage);
-	base_blkno = entries[entry_idx].base_blkno;
-	old_delta_blkno = entries[entry_idx].delta_blkno;
-
-	if (!BlockNumberIsValid(base_blkno))
-		elog(ERROR, "bwtree: PID %u has invalid base block number",
-			 (unsigned int) pid);
-
-	basebuf = _bwt_getbuf(rel, base_blkno, BWT_READ);
-	basepage = BufferGetPage(basebuf);
-	base_opaque = BWTreePageGetOpaque(basepage);
-
-	if (BWTreePageIsLeaf(base_opaque))
-		flags |= BWT_LEAF;
-	if (BWTreePageIsRoot(base_opaque))
-		flags |= BWT_ROOT;
 
 	data_len = (itup != NULL) ? IndexTupleSize(itup) : 0;
 	item_size = SizeOfBWTreeDeltaRecord + data_len;
@@ -258,28 +262,114 @@ _bwt_delta_install(Relation rel, BWTreeMetaPageData *metad,
 	if (data_len > 0)
 		memcpy(item_data + SizeOfBWTreeDeltaRecord, itup, data_len);
 
-	deltabuf = _bwt_allocbuf(rel);
-	deltapage = BufferGetPage(deltabuf);
-	_bwt_initpage(deltapage, flags, pid, base_opaque->bwto_level);
-	delta_opaque = BWTreePageGetOpaque(deltapage);
-	delta_opaque->bwto_next = old_delta_blkno;
+	/*
+	 * Paper-aligned optimistic install:
+	 * 1) snapshot current mapping entry
+	 * 2) build new delta page
+	 * 3) CAS publish as new delta head
+	 * 4) on conflict, retry (including base change restart)
+	 */
+	for (;;)
+	{
+		BlockNumber			base_blkno;
+		BlockNumber			old_delta_blkno;
+		Buffer				basebuf;
+		Page				basepage;
+		BWTreePageOpaque	base_opaque;
+		Buffer				deltabuf;
+		Page				deltapage;
+		BWTreePageOpaque	delta_opaque;
+		BlockNumber			new_delta_blkno;
+		OffsetNumber		offnum;
+		uint16				flags = BWT_DELTA;
+		bool				restart = false;
 
-	offnum = PageAddItem(deltapage, (Item) item_data, item_size,
-						 InvalidOffsetNumber, false, false);
-	if (offnum == InvalidOffsetNumber)
-		elog(ERROR, "bwtree: failed to add delta record for PID %u",
-			 (unsigned int) pid);
+		if (retry_guard++ > 1024)
+		{
+			pfree(item_data);
+			elog(ERROR, "bwtree: delta install exceeded retry bound for PID %u",
+				 (unsigned int) pid);
+		}
 
-	MarkBufferDirty(deltabuf);
-	_bwt_relbuf(rel, basebuf, BWT_READ);
+		if (!_bwt_map_lookup(rel, metad, pid, &base_blkno, &old_delta_blkno))
+		{
+			pfree(item_data);
+			elog(ERROR, "bwtree: cannot install delta on unknown PID %u",
+				 (unsigned int) pid);
+		}
+		if (!BlockNumberIsValid(base_blkno))
+		{
+			pfree(item_data);
+			elog(ERROR, "bwtree: PID %u has invalid base block number",
+				 (unsigned int) pid);
+		}
 
-	entries[entry_idx].base_blkno = base_blkno;
-	entries[entry_idx].delta_blkno = BufferGetBlockNumber(deltabuf);
-	MarkBufferDirty(mapbuf);
-	_bwt_relbuf(rel, mapbuf, BWT_WRITE);
-	_bwt_relbuf(rel, deltabuf, BWT_WRITE);
+		basebuf = _bwt_getbuf(rel, base_blkno, BWT_READ);
+		basepage = BufferGetPage(basebuf);
+		base_opaque = BWTreePageGetOpaque(basepage);
+		if (BWTreePageIsLeaf(base_opaque))
+			flags |= BWT_LEAF;
+		if (BWTreePageIsRoot(base_opaque))
+			flags |= BWT_ROOT;
 
-	pfree(item_data);
+		deltabuf = _bwt_allocbuf(rel);
+		deltapage = BufferGetPage(deltabuf);
+		_bwt_initpage(deltapage, flags, pid, base_opaque->bwto_level);
+		delta_opaque = BWTreePageGetOpaque(deltapage);
+		new_delta_blkno = BufferGetBlockNumber(deltabuf);
+
+		offnum = PageAddItem(deltapage, (Item) item_data, item_size,
+							 InvalidOffsetNumber, false, false);
+		_bwt_relbuf(rel, basebuf, BWT_READ);
+		if (offnum == InvalidOffsetNumber)
+		{
+			_bwt_relbuf(rel, deltabuf, BWT_WRITE);
+			RecordFreeIndexPage(rel, new_delta_blkno);
+			pfree(item_data);
+			elog(ERROR, "bwtree: failed to add delta record for PID %u",
+				 (unsigned int) pid);
+		}
+
+		for (;;)
+		{
+			BlockNumber observed_base_blkno = InvalidBlockNumber;
+			BlockNumber observed_delta_blkno = InvalidBlockNumber;
+			bool		published;
+
+			delta_opaque->bwto_next = old_delta_blkno;
+			MarkBufferDirty(deltabuf);
+
+			published = _bwt_map_cas(rel, metad, pid,
+									 base_blkno, old_delta_blkno,
+									 base_blkno, new_delta_blkno,
+									 &observed_base_blkno,
+									 &observed_delta_blkno);
+			if (published)
+			{
+				_bwt_relbuf(rel, deltabuf, BWT_WRITE);
+				pfree(item_data);
+				return;
+			}
+
+			if (observed_base_blkno != base_blkno)
+			{
+				/*
+				 * Base changed (e.g. consolidation/split rewrite). Drop this
+				 * unpublished delta page and restart from fresh mapping state.
+				 */
+				_bwt_relbuf(rel, deltabuf, BWT_WRITE);
+				RecordFreeIndexPage(rel, new_delta_blkno);
+				restart = true;
+				break;
+			}
+
+			/* Same base, newer delta head: relink and retry CAS publish. */
+			old_delta_blkno = observed_delta_blkno;
+		}
+
+		if (restart)
+			continue;
+	}
 }
 
 int
@@ -297,6 +387,9 @@ _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
 	 *   extra memory and CPU.
 	 */
 	BlockNumber				cur_blkno;
+	BlockNumber				rel_nblocks;
+	BlockNumber				hops = 0;
+	BlockNumber				hops_limit;
 	BWTreeDeltaApplyEntry   *entries = NULL;
 	int						nentries = 0;
 	int						capacity = 0;
@@ -307,6 +400,8 @@ _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
 		elog(ERROR, "bwtree: delta-apply requires a valid base page");
 
 	cur_blkno = delta_blkno;
+	rel_nblocks = RelationGetNumberOfBlocks(rel);
+	hops_limit = rel_nblocks + 1;
 	while (BlockNumberIsValid(cur_blkno))
 	{
 		Buffer					buf;
@@ -316,6 +411,11 @@ _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
 		ItemId					itemid;
 		BWTreeDeltaRecordData  *drec;
 		Size					rec_size;
+
+		if (cur_blkno >= rel_nblocks)
+			elog(ERROR, "bwtree: delta chain points outside relation (blk=%u nblocks=%u)",
+				 (unsigned int) cur_blkno,
+				 (unsigned int) rel_nblocks);
 
 		buf = _bwt_getbuf(rel, cur_blkno, BWT_READ);
 		page = BufferGetPage(buf);
@@ -363,6 +463,9 @@ _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
 
 		cur_blkno = opaque->bwto_next;
 		_bwt_relbuf(rel, buf, BWT_READ);
+		hops++;
+		if (hops > hops_limit)
+			elog(ERROR, "bwtree: delta-apply exceeded safety bound (possible chain cycle)");
 	}
 
 	for (i = nentries - 1; i >= 0; i--)
@@ -398,11 +501,6 @@ _bwt_delta_apply(Relation rel, BlockNumber delta_blkno,
 				/*
 				 * Split/separator deltas are control-plane metadata and do not
 				 * directly add/remove tuples on the base page.
-				 *
-				 * Correctness-first note:
-				 * consolidation is disabled in this project stage, so these
-				 * structural deltas remain in-chain and are not dropped by
-				 * materialization-only paths.
 				 */
 				break;
 		}
@@ -464,6 +562,7 @@ _bwt_capture_node_snapshot(Relation rel, BWTreeMetaPageData *metad,
 	snapshot->base_blkno = base_blkno;
 	snapshot->delta_blkno = delta_blkno;
 	snapshot->level = base_opaque->bwto_level;
+	snapshot->flags = base_opaque->bwto_flags;
 	snapshot->is_leaf = BWTreePageIsLeaf(base_opaque);
 	snapshot->is_root = BWTreePageIsRoot(base_opaque);
 
@@ -527,6 +626,9 @@ _bwt_materialize_node(Relation rel, BWTreeMetaPageData *metad,
 					  BWTreePid pid, BWTreeNodeView *view)
 {
 	BlockNumber				cur_blkno;
+	BlockNumber				rel_nblocks;
+	BlockNumber				hops = 0;
+	BlockNumber				hops_limit;
 
 	if (view == NULL)
 		elog(ERROR, "bwtree: materialize-node output pointer must not be NULL");
@@ -541,6 +643,8 @@ _bwt_materialize_node(Relation rel, BWTreeMetaPageData *metad,
 	_bwt_materialize_from_snapshot(rel, &view->snapshot, &view->page);
 
 	cur_blkno = view->snapshot.delta_blkno;
+	rel_nblocks = RelationGetNumberOfBlocks(rel);
+	hops_limit = rel_nblocks + 1;
 	while (BlockNumberIsValid(cur_blkno))
 	{
 		Buffer					buf;
@@ -549,6 +653,11 @@ _bwt_materialize_node(Relation rel, BWTreeMetaPageData *metad,
 		OffsetNumber			maxoff;
 		ItemId					itemid;
 		BWTreeDeltaRecordData  *drec;
+
+		if (cur_blkno >= rel_nblocks)
+			elog(ERROR, "bwtree: materialize-node delta chain points outside relation (blk=%u nblocks=%u)",
+				 (unsigned int) cur_blkno,
+				 (unsigned int) rel_nblocks);
 
 		buf = _bwt_getbuf(rel, cur_blkno, BWT_READ);
 		page = BufferGetPage(buf);
@@ -596,6 +705,9 @@ _bwt_materialize_node(Relation rel, BWTreeMetaPageData *metad,
 
 		cur_blkno = opaque->bwto_next;
 		_bwt_relbuf(rel, buf, BWT_READ);
+		hops++;
+		if (hops > hops_limit)
+			elog(ERROR, "bwtree: materialize-node exceeded safety bound (possible delta cycle)");
 	}
 }
 
@@ -618,33 +730,199 @@ bool
 _bwt_should_consolidate(Relation rel, BWTreeMetaPageData *metad,
 						BWTreePid pid)
 {
-	/*
-	 * Correctness-first policy for the course deliverable:
-	 *
-	 * We intentionally disable consolidation for now. The current project
-	 * stage prioritizes concurrent correctness over space efficiency, and
-	 * avoids publishing a consolidated base while split/separator semantics
-	 * and garbage reclamation are still incomplete.
-	 *
-	 * Trade-off:
-	 *   - Simpler and safer behavior under concurrency
-	 *   - Larger delta chains, more space usage, and extra read amplification
-	 */
-	(void) rel;
-	(void) metad;
-	(void) pid;
+	BWTreeNodeSnapshot	snapshot;
+	BlockNumber			cur_blkno;
+	BlockNumber			hops = 0;
+	BlockNumber			hops_limit;
+	int					chain_len = 0;
+
+	if (!_bwt_capture_node_snapshot(rel, metad, pid, &snapshot))
+		return false;
+	if (!BlockNumberIsValid(snapshot.delta_blkno))
+		return false;
+
+	cur_blkno = snapshot.delta_blkno;
+	hops_limit = RelationGetNumberOfBlocks(rel) + 1;
+	while (BlockNumberIsValid(cur_blkno))
+	{
+		Buffer			buf;
+		Page			page;
+		BWTreePageOpaque opaque;
+
+		buf = _bwt_getbuf(rel, cur_blkno, BWT_READ);
+		page = BufferGetPage(buf);
+		opaque = BWTreePageGetOpaque(page);
+		if (opaque->bwto_page_id != BWTREE_PAGE_ID || !BWTreePageIsDelta(opaque))
+		{
+			_bwt_relbuf(rel, buf, BWT_READ);
+			break;
+		}
+
+		chain_len++;
+		cur_blkno = opaque->bwto_next;
+		_bwt_relbuf(rel, buf, BWT_READ);
+		hops++;
+		if (hops > hops_limit)
+			elog(ERROR, "bwtree: delta chain walk exceeded safety bound for PID %u",
+				 (unsigned int) pid);
+
+		if (chain_len >= BWTREE_DELTA_CHAIN_THRESHOLD)
+			return true;
+	}
+
 	return false;
 }
 
 void
 _bwt_consolidate(Relation rel, BWTreeMetaPageData *metad, BWTreePid pid)
 {
-	/*
-	 * See _bwt_should_consolidate(): consolidation is intentionally disabled
-	 * at this stage to preserve correctness while SMO semantics and GC are
-	 * not fully implemented.
-	 */
-	(void) rel;
-	(void) metad;
-	(void) pid;
+	int	retry;
+
+	for (retry = 0; retry < 16; retry++)
+	{
+		BWTreeNodeSnapshot	snapshot;
+		BWTMaterializedPage	mpage;
+		Buffer				newbasebuf;
+		Page				newbasepage;
+		BWTreePageOpaque	newopaque;
+		BlockNumber			newbase_blkno;
+		BlockNumber			observed_base_blkno = InvalidBlockNumber;
+		BlockNumber			observed_delta_blkno = InvalidBlockNumber;
+		Buffer				oldbasebuf;
+		uint16				flags = 0;
+		bool				published;
+		int					i;
+
+		if (!_bwt_capture_node_snapshot(rel, metad, pid, &snapshot))
+			return;
+		if (!BlockNumberIsValid(snapshot.delta_blkno))
+			return;
+
+		/*
+		 * Build a stable logical view from (base + delta chain).
+		 */
+		_bwt_materialize_from_snapshot(rel, &snapshot, &mpage);
+
+		newbasebuf = _bwt_allocbuf(rel);
+		newbasepage = BufferGetPage(newbasebuf);
+		newbase_blkno = BufferGetBlockNumber(newbasebuf);
+
+		if (snapshot.is_leaf)
+			flags |= BWT_LEAF;
+		if (snapshot.is_root)
+			flags |= BWT_ROOT;
+		_bwt_initpage(newbasepage, flags, snapshot.pid, snapshot.level);
+		newopaque = BWTreePageGetOpaque(newbasepage);
+		newopaque->bwto_prev = mpage.prev_blkno;
+		newopaque->bwto_next = mpage.next_blkno;
+
+		for (i = 0; i < mpage.nitems; i++)
+		{
+			IndexTuple	itup;
+			OffsetNumber offnum;
+
+			itup = mpage.items[i];
+			if (itup == NULL)
+				continue;
+
+			offnum = PageAddItem(newbasepage, (Item) itup, IndexTupleSize(itup),
+								 InvalidOffsetNumber, false, false);
+			if (offnum == InvalidOffsetNumber)
+			{
+				_bwt_relbuf(rel, newbasebuf, BWT_WRITE);
+				RecordFreeIndexPage(rel, newbase_blkno);
+				_bwt_free_materialized_page(&mpage);
+				elog(ERROR, "bwtree: consolidation output overflow for PID %u",
+					 (unsigned int) pid);
+			}
+		}
+		MarkBufferDirty(newbasebuf);
+
+		/*
+		 * Concurrency hardening:
+		 * hold old-base write latch across mapping validation + publish CAS.
+		 * This blocks concurrent split/internal rewrite that operate on the
+		 * same base page while consolidation attempts base swap.
+		 */
+		oldbasebuf = _bwt_getbuf(rel, snapshot.base_blkno, BWT_WRITE);
+		if (!_bwt_map_lookup(rel, metad, pid,
+							 &observed_base_blkno, &observed_delta_blkno) ||
+			observed_base_blkno != snapshot.base_blkno ||
+			observed_delta_blkno != snapshot.delta_blkno)
+		{
+			_bwt_relbuf(rel, oldbasebuf, BWT_WRITE);
+			_bwt_relbuf(rel, newbasebuf, BWT_WRITE);
+			RecordFreeIndexPage(rel, newbase_blkno);
+			_bwt_free_materialized_page(&mpage);
+			if (observed_delta_blkno == InvalidBlockNumber)
+				return;
+			continue;
+		}
+
+		/*
+		 * Publish consolidated snapshot with one CAS:
+		 * (old_base, old_delta_head) -> (new_base, InvalidDelta)
+		 */
+		published = _bwt_map_cas(rel, metad, pid,
+								 snapshot.base_blkno, snapshot.delta_blkno,
+								 newbase_blkno, InvalidBlockNumber,
+								 &observed_base_blkno,
+								 &observed_delta_blkno);
+		_bwt_relbuf(rel, oldbasebuf, BWT_WRITE);
+		_bwt_relbuf(rel, newbasebuf, BWT_WRITE);
+
+		if (published)
+		{
+			bool	old_detached;
+			uint64	retire_epoch;
+
+			/*
+			 * Correctness-first requirement:
+			 *
+			 * This codebase uses physical sibling block links for range scan.
+			 * After base swap, relink neighbors to the new base block before
+			 * reclaiming the old base block.
+			 */
+			old_detached = _bwt_relink_neighbors_on_base_swap(rel,
+															  snapshot.base_blkno,
+															  newbase_blkno,
+															  mpage.prev_blkno,
+															  mpage.next_blkno);
+
+			retire_epoch = _bwt_epoch_enter();
+			PG_TRY();
+			{
+				_bwt_gc_retire_delta_chain(rel, pid, snapshot.delta_blkno, retire_epoch);
+				if (old_detached)
+					_bwt_gc_retire_block(rel, snapshot.base_blkno, retire_epoch);
+			}
+			PG_CATCH();
+			{
+				_bwt_epoch_exit();
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			_bwt_epoch_exit();
+			/* Keep silent on conservative reclaim skip under concurrent relink. */
+			(void) old_detached;
+			_bwt_free_materialized_page(&mpage);
+			return;
+		}
+
+		/*
+		 * This new base page was never published; recycle it immediately.
+		 */
+		RecordFreeIndexPage(rel, newbase_blkno);
+		_bwt_free_materialized_page(&mpage);
+
+		/*
+		 * If someone already published a consolidated state, we are done.
+		 * Otherwise, retry from fresh snapshot.
+		 */
+		if (observed_delta_blkno == InvalidBlockNumber)
+			return;
+	}
+
+	elog(ERROR, "bwtree: consolidation exceeded retry bound for PID %u",
+		 (unsigned int) pid);
 }

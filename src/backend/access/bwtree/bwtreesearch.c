@@ -1,10 +1,3 @@
-/*-------------------------------------------------------------------------
- *
- * bwtreesearch.c
- *    Search skeletons for the Bw-tree.
- *
- *-------------------------------------------------------------------------
- */
 #include "postgres.h"
 
 #include "access/bwtree.h"
@@ -16,13 +9,20 @@
  * (e.g., internal-node downlink cycles).
  */
 #define BWTREE_MAX_DESCEND_STEPS	1024
-
 static int32 _bwt_compare_tuple(Relation rel, ScanKey scankey, int nkeys,
 								IndexTuple itup);
 static BWTreePid _bwt_choose_child_pid(Relation rel, ScanKey scankey, int nkeys,
 									   const BWTreeNodeView *view);
+static bool _bwt_leaf_should_move_right_fast(Relation rel,
+											 const BWTreeNodeSnapshot *snapshot,
+											 ScanKey scankey, int nkeys,
+											 BWTreePid *right_pid_out);
 static bool _bwt_should_move_right(Relation rel, ScanKey scankey, int nkeys,
 								   const BWTreeNodeView *view);
+static void _bwt_validate_right_sibling_snapshot(Relation rel,
+												 BWTreeMetaPageData *metad,
+												 const BWTreeNodeSnapshot *left_snapshot,
+												 BWTreePid right_pid);
 static void _bwt_validate_right_sibling(Relation rel, BWTreeMetaPageData *metad,
 										const BWTreeNodeView *view,
 										BWTreePid right_pid);
@@ -132,41 +132,67 @@ _bwt_descend_to_leaf(Relation rel, BWTreeMetaPageData *metad,
 
 	for (step = 0; step < BWTREE_MAX_DESCEND_STEPS; step++)
 	{
-		BWTreeNodeView	view;
-		BWTreePid		next_pid;
+		BWTreeNodeSnapshot	cur_snapshot;
 
 		CHECK_FOR_INTERRUPTS();
-		_bwt_materialize_node(rel, metad, cur_pid, &view);
+		if (!_bwt_capture_node_snapshot(rel, metad, cur_pid, &cur_snapshot))
+			elog(ERROR, "bwtree: descend cannot find PID %u",
+				 (unsigned int) cur_pid);
 
 		/*
-		 * Correctness-first split routing:
+		 * Insert/search hot path optimization:
 		 *
-		 * If a split delta exists and key belongs to the right half, move to
-		 * split_right_pid before recording this level in traversal stack.
-		 * This approximates "move-right" semantics even while full SMO
-		 * publication protocol is still under construction.
+		 * For leaf nodes, avoid full node materialization. We only inspect
+		 * split-control deltas and can return leaf snapshot directly.
 		 */
-		if (_bwt_should_move_right(rel, scankey, nkeys, &view))
+		if (cur_snapshot.is_leaf)
 		{
-			_bwt_validate_right_sibling(rel, metad, &view, view.split_right_pid);
-			cur_pid = view.split_right_pid;
-			_bwt_free_node_view(&view);
-			continue;
-		}
+			BWTreePid	split_right_pid = InvalidBWTreePid;
 
-		_bwt_push_pid(ctx, cur_pid);
+			if (_bwt_leaf_should_move_right_fast(rel, &cur_snapshot,
+												 scankey, nkeys,
+												 &split_right_pid))
+			{
+				_bwt_validate_right_sibling_snapshot(rel, metad,
+													 &cur_snapshot,
+													 split_right_pid);
+				cur_pid = split_right_pid;
+				continue;
+			}
 
-		if (view.snapshot.is_leaf)
-		{
-			*leaf_snapshot = view.snapshot;
-			_bwt_free_node_view(&view);
+			_bwt_push_pid(ctx, cur_pid);
+			*leaf_snapshot = cur_snapshot;
 			return true;
 		}
 
-		next_pid = _bwt_choose_child_pid(rel, scankey, nkeys, &view);
-		_bwt_validate_child_link(rel, metad, &view, next_pid);
-		cur_pid = next_pid;
-		_bwt_free_node_view(&view);
+		{
+			BWTreeNodeView	view;
+			BWTreePid		next_pid;
+
+			_bwt_materialize_node(rel, metad, cur_pid, &view);
+
+			/*
+			 * Correctness-first split routing:
+			 *
+			 * If a split delta exists and key belongs to the right half, move to
+			 * split_right_pid before recording this level in traversal stack.
+			 * This approximates "move-right" semantics even while full SMO
+			 * publication protocol is still under construction.
+			 */
+			if (_bwt_should_move_right(rel, scankey, nkeys, &view))
+			{
+				_bwt_validate_right_sibling(rel, metad, &view, view.split_right_pid);
+				cur_pid = view.split_right_pid;
+				_bwt_free_node_view(&view);
+				continue;
+			}
+
+			_bwt_push_pid(ctx, cur_pid);
+			next_pid = _bwt_choose_child_pid(rel, scankey, nkeys, &view);
+			_bwt_validate_child_link(rel, metad, &view, next_pid);
+			cur_pid = next_pid;
+			_bwt_free_node_view(&view);
+		}
 	}
 
 	elog(ERROR, "bwtree: descend-to-leaf exceeded max steps (possible routing cycle)");
@@ -284,6 +310,115 @@ _bwt_compare_tuple(Relation rel, ScanKey scankey, int nkeys, IndexTuple itup)
 }
 
 static bool
+_bwt_leaf_should_move_right_fast(Relation rel,
+								 const BWTreeNodeSnapshot *snapshot,
+								 ScanKey scankey, int nkeys,
+								 BWTreePid *right_pid_out)
+{
+	BlockNumber	cur_blkno;
+	BlockNumber	rel_nblocks;
+	BlockNumber	hops = 0;
+	BlockNumber	hops_limit;
+	bool		has_split = false;
+	bool		has_separator = false;
+	int32		separator_cmp = 0;
+	BWTreePid	split_right_pid = InvalidBWTreePid;
+
+	if (right_pid_out != NULL)
+		*right_pid_out = InvalidBWTreePid;
+
+	if (rel == NULL || snapshot == NULL)
+		return false;
+	if (!snapshot->is_leaf)
+		return false;
+	if (!BlockNumberIsValid(snapshot->delta_blkno))
+		return false;
+	if (scankey == NULL || nkeys <= 0)
+		return false;
+
+	cur_blkno = snapshot->delta_blkno;
+	rel_nblocks = RelationGetNumberOfBlocks(rel);
+	hops_limit = rel_nblocks + 1;
+
+	while (BlockNumberIsValid(cur_blkno))
+	{
+		Buffer					buf;
+		Page					page;
+		BWTreePageOpaque		opaque;
+		OffsetNumber			maxoff;
+		BlockNumber				next_blkno;
+
+		if (cur_blkno >= rel_nblocks)
+			elog(ERROR, "bwtree: leaf move-right chain points outside relation (blk=%u nblocks=%u)",
+				 (unsigned int) cur_blkno,
+				 (unsigned int) rel_nblocks);
+
+		buf = _bwt_getbuf(rel, cur_blkno, BWT_READ);
+		page = BufferGetPage(buf);
+		opaque = BWTreePageGetOpaque(page);
+		if (opaque->bwto_page_id != BWTREE_PAGE_ID || !BWTreePageIsDelta(opaque))
+		{
+			_bwt_relbuf(rel, buf, BWT_READ);
+			elog(ERROR, "bwtree: leaf move-right encountered non-delta page in chain (blk=%u)",
+				 (unsigned int) cur_blkno);
+		}
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		if (maxoff >= FirstOffsetNumber)
+		{
+			ItemId					itemid;
+			BWTreeDeltaRecordData  *drec;
+
+			itemid = PageGetItemId(page, FirstOffsetNumber);
+			if (ItemIdIsUsed(itemid))
+			{
+				drec = (BWTreeDeltaRecordData *) PageGetItem(page, itemid);
+				if (!has_split && drec->type == BW_DELTA_SPLIT)
+				{
+					has_split = true;
+					split_right_pid = drec->related_pid;
+				}
+				else if (!has_separator &&
+						 drec->type == BW_DELTA_SEPARATOR &&
+						 drec->data_len > 0)
+				{
+					IndexTuple sep_itup;
+
+					sep_itup = BWTreeDeltaRecordGetTuple(drec);
+					if (sep_itup != NULL)
+					{
+						has_separator = true;
+						separator_cmp = _bwt_compare_tuple(rel, scankey, nkeys, sep_itup);
+					}
+				}
+			}
+		}
+
+		next_blkno = opaque->bwto_next;
+		_bwt_relbuf(rel, buf, BWT_READ);
+		cur_blkno = next_blkno;
+
+		if (has_split && has_separator)
+			break;
+
+		hops++;
+		if (hops > hops_limit)
+			elog(ERROR, "bwtree: leaf move-right check exceeded safety bound");
+	}
+
+	if (has_split && has_separator &&
+		split_right_pid != InvalidBWTreePid &&
+		separator_cmp >= 0)
+	{
+		if (right_pid_out != NULL)
+			*right_pid_out = split_right_pid;
+		return true;
+	}
+
+	return false;
+}
+
+static bool
 _bwt_should_move_right(Relation rel, ScanKey scankey, int nkeys,
 					   const BWTreeNodeView *view)
 {
@@ -297,6 +432,36 @@ _bwt_should_move_right(Relation rel, ScanKey scankey, int nkeys,
 		return false;
 
 	return (_bwt_compare_tuple(rel, scankey, nkeys, view->split_separator) >= 0);
+}
+
+static void
+_bwt_validate_right_sibling_snapshot(Relation rel, BWTreeMetaPageData *metad,
+									 const BWTreeNodeSnapshot *left_snapshot,
+									 BWTreePid right_pid)
+{
+	BWTreeNodeSnapshot	right_snapshot;
+
+	if (left_snapshot == NULL || metad == NULL)
+		elog(ERROR, "bwtree: validate-right-sibling-snapshot requires valid inputs");
+	if (right_pid == InvalidBWTreePid || right_pid >= metad->bwt_next_pid)
+		elog(ERROR, "bwtree: invalid split right PID %u from PID %u",
+			 (unsigned int) right_pid,
+			 (unsigned int) ((left_snapshot != NULL) ?
+							 left_snapshot->pid : InvalidBWTreePid));
+	if (right_pid == left_snapshot->pid)
+		elog(ERROR, "bwtree: split right PID equals source PID %u",
+			 (unsigned int) right_pid);
+	if (!_bwt_capture_node_snapshot(rel, metad, right_pid, &right_snapshot))
+		elog(ERROR, "bwtree: split right PID %u is not mapped",
+			 (unsigned int) right_pid);
+	if (right_snapshot.level != left_snapshot->level)
+		elog(ERROR, "bwtree: split sibling level mismatch: left level %u right level %u",
+			 (unsigned int) left_snapshot->level,
+			 (unsigned int) right_snapshot.level);
+	if (right_snapshot.is_leaf != left_snapshot->is_leaf)
+		elog(ERROR, "bwtree: split sibling leaf flag mismatch for PID %u -> %u",
+			 (unsigned int) left_snapshot->pid,
+			 (unsigned int) right_pid);
 }
 
 static void

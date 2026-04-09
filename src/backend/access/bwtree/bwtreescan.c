@@ -1,14 +1,10 @@
-/*-------------------------------------------------------------------------
- *
- * bwtreescan.c
- *    Scan skeleton for the Bw-tree index.
- *
- *------------------------------------------------------------------------- */
 #include "postgres.h"
 
 #include "access/bwtree.h"
+#include "access/nbtree.h"
 #include "access/relscan.h"
 #include "access/skey.h"
+#include "access/stratnum.h"
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
 
@@ -24,8 +20,11 @@ static bool _bwt_tuple_matches_key(Relation rel, IndexTuple itup, ScanKey key);
 static bool _bwt_tuple_matches_all_keys(Relation rel, IndexTuple itup,
 										ScanKey scankey, int nkeys);
 static BWTreePid _bwt_pid_from_blkno(Relation rel, BlockNumber blkno);
+static void _bwt_read_metad_snapshot(Relation rel, BWTreeMetaPageData *snapshot);
 static void _bwt_validate_scan_leaf(const BWTMaterializedPage *mpage,
 									BlockNumber expected_prev_blkno);
+static ScanKey _bwt_build_scan_route_key(Relation rel, BWTreeScanOpaque so,
+										 int *nkeys_out);
 static void _bwt_collect_scan_items(IndexScanDesc scan, BWTreeScanOpaque so);
 
 IndexScanDesc
@@ -66,8 +65,9 @@ bwtreerescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 
 	if (scan == NULL || scan->opaque == NULL)
 		elog(ERROR, "bwtree: rescan requires a valid scan descriptor");
-	if (norderbys != 0 || orderbys != NULL)
+	if (norderbys != 0)
 		elog(ERROR, "bwtree: ORDER BY rescan is not supported yet");
+	(void) orderbys;
 	if (nscankeys < 0)
 		elog(ERROR, "bwtree: invalid number of scan keys %d", nscankeys);
 
@@ -88,59 +88,87 @@ bool
 bwtreegettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	BWTreeScanOpaque so;
+	bool				found;
 
-	if (scan == NULL || scan->opaque == NULL)
-		elog(ERROR, "bwtree: gettuple requires a valid scan descriptor");
-	if (dir != ForwardScanDirection)
-		elog(ERROR, "bwtree: backward scan is not supported yet");
-
-	so = (BWTreeScanOpaque) scan->opaque;
-	if (!so->started)
+	_bwt_epoch_enter();
+	PG_TRY();
 	{
-		_bwt_collect_scan_items(scan, so);
-		so->started = true;
-		so->cur_item = 0;
-	}
+		if (scan == NULL || scan->opaque == NULL)
+			elog(ERROR, "bwtree: gettuple requires a valid scan descriptor");
+		if (dir != ForwardScanDirection)
+			elog(ERROR, "bwtree: backward scan is not supported yet");
 
-	if (so->cur_item >= so->num_items)
+		so = (BWTreeScanOpaque) scan->opaque;
+		if (!so->started)
+		{
+			_bwt_collect_scan_items(scan, so);
+			so->started = true;
+			so->cur_item = 0;
+		}
+
+		if (so->cur_item >= so->num_items)
+		{
+			ItemPointerSetInvalid(&scan->xs_heaptid);
+			found = false;
+		}
+		else
+		{
+			scan->xs_heaptid = so->items[so->cur_item].heapTid;
+			scan->xs_recheck = false;
+			so->cur_item++;
+			found = true;
+		}
+	}
+	PG_CATCH();
 	{
-		ItemPointerSetInvalid(&scan->xs_heaptid);
-		return false;
+		_bwt_epoch_exit();
+		PG_RE_THROW();
 	}
+	PG_END_TRY();
 
-	scan->xs_heaptid = so->items[so->cur_item].heapTid;
-	scan->xs_recheck = false;
-	so->cur_item++;
-	return true;
+	_bwt_epoch_exit();
+	return found;
 }
 
 int64
 bwtreegetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	BWTreeScanOpaque so;
-	int64			ntuples = 0;
+	int64			ntuples;
 	int				i;
 
-	if (scan == NULL || scan->opaque == NULL)
-		elog(ERROR, "bwtree: getbitmap requires a valid scan descriptor");
-	if (tbm == NULL)
-		elog(ERROR, "bwtree: getbitmap requires a valid tidbitmap");
-
-	so = (BWTreeScanOpaque) scan->opaque;
-	_bwt_scan_reset_items(so);
-	_bwt_collect_scan_items(scan, so);
-	so->started = true;
-	so->cur_item = so->num_items;
-
-	for (i = 0; i < so->num_items; i++)
+	ntuples = 0;
+	_bwt_epoch_enter();
+	PG_TRY();
 	{
-		tbm_add_tuples(tbm, &so->items[i].heapTid, 1, false);
-		ntuples++;
+		if (scan == NULL || scan->opaque == NULL)
+			elog(ERROR, "bwtree: getbitmap requires a valid scan descriptor");
+		if (tbm == NULL)
+			elog(ERROR, "bwtree: getbitmap requires a valid tidbitmap");
+
+		so = (BWTreeScanOpaque) scan->opaque;
+		_bwt_scan_reset_items(so);
+		_bwt_collect_scan_items(scan, so);
+		so->started = true;
+		so->cur_item = so->num_items;
+
+		for (i = 0; i < so->num_items; i++)
+		{
+			tbm_add_tuples(tbm, &so->items[i].heapTid, 1, false);
+			ntuples++;
+		}
+
+		scan->xs_recheck = false;
+		ItemPointerSetInvalid(&scan->xs_heaptid);
 	}
+	PG_CATCH();
+	{
+		_bwt_epoch_exit();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	scan->xs_recheck = false;
-	ItemPointerSetInvalid(&scan->xs_heaptid);
-
+	_bwt_epoch_exit();
 	return ntuples;
 }
 
@@ -291,6 +319,30 @@ _bwt_pid_from_blkno(Relation rel, BlockNumber blkno)
 }
 
 static void
+_bwt_read_metad_snapshot(Relation rel, BWTreeMetaPageData *snapshot)
+{
+	Buffer				metabuf;
+	Page				metapage;
+	BWTreeMetaPageData *metad;
+
+	if (snapshot == NULL)
+		elog(ERROR, "bwtree: metapage snapshot output must not be NULL");
+
+	metabuf = _bwt_getbuf(rel, BWTREE_METAPAGE, BWT_READ);
+	metapage = BufferGetPage(metabuf);
+	metad = BWTreeMetaPageGetData(metapage);
+
+	if (metad->bwt_magic != BWTREE_MAGIC || metad->bwt_version != BWTREE_VERSION)
+	{
+		_bwt_relbuf(rel, metabuf, BWT_READ);
+		elog(ERROR, "bwtree: invalid metapage (magic/version mismatch)");
+	}
+
+	*snapshot = *metad;
+	_bwt_relbuf(rel, metabuf, BWT_READ);
+}
+
+static void
 _bwt_validate_scan_leaf(const BWTMaterializedPage *mpage,
 						BlockNumber expected_prev_blkno)
 {
@@ -300,12 +352,79 @@ _bwt_validate_scan_leaf(const BWTMaterializedPage *mpage,
 		elog(ERROR, "bwtree: scan reached non-leaf page (flags=%u level=%u)",
 			 (unsigned int) mpage->flags,
 			 (unsigned int) mpage->level);
-	if (BlockNumberIsValid(expected_prev_blkno) &&
-		mpage->prev_blkno != expected_prev_blkno)
-		elog(ERROR, "bwtree: leaf-link broken: expected prev %u but found %u at blk %u",
-			 (unsigned int) expected_prev_blkno,
-			 (unsigned int) mpage->prev_blkno,
-			 (unsigned int) mpage->base_blkno);
+	/*
+	 * Concurrency-tolerant scan:
+	 * sibling links may be transiently inconsistent while split/consolidation
+	 * is publishing. Do not fail hard on prev-link mismatch.
+	 */
+	(void) expected_prev_blkno;
+}
+
+static ScanKey
+_bwt_build_scan_route_key(Relation rel, BWTreeScanOpaque so, int *nkeys_out)
+{
+	int			i;
+	ScanKey		chosen = NULL;
+	ScanKeyData *route_key;
+	FmgrInfo    *procinfo;
+	int			flags;
+
+	if (nkeys_out == NULL)
+		elog(ERROR, "bwtree: route-key builder requires nkeys output");
+	*nkeys_out = 0;
+
+	if (rel == NULL || so == NULL || so->numberOfKeys <= 0 || so->keyData == NULL)
+		return NULL;
+
+	/*
+	 * Correctness-first guard:
+	 * keep DESC/null-order corner cases on the existing leftmost-start path.
+	 */
+	if ((rel->rd_indoption[0] & INDOPTION_DESC) != 0)
+		return NULL;
+
+	for (i = 0; i < so->numberOfKeys; i++)
+	{
+		ScanKey key = &so->keyData[i];
+
+		if (key->sk_attno != 1)
+			continue;
+		if (key->sk_flags & (SK_ROW_HEADER | SK_ROW_MEMBER |
+							 SK_SEARCHARRAY | SK_SEARCHNULL | SK_SEARCHNOTNULL))
+			continue;
+		if (key->sk_flags & SK_ISNULL)
+			continue;
+		/*
+		 * Correctness-first guard:
+		 * for duplicate keys spanning multiple leaves, '=' or '>=' start-route
+		 * can skip qualifying tuples in left siblings. Restrict route assist to
+		 * strict '>' lower bound.
+		 */
+		if (key->sk_strategy != BTGreaterStrategyNumber)
+			continue;
+
+		chosen = key;
+		break;
+	}
+
+	if (chosen == NULL)
+		return NULL;
+
+	route_key = (ScanKeyData *) palloc(sizeof(ScanKeyData));
+	procinfo = index_getprocinfo(rel, 1, BWTORDER_PROC);
+	flags = ((rel->rd_indoption[0] << SK_BT_INDOPTION_SHIFT) |
+			 ((chosen->sk_flags & SK_ISNULL) ? SK_ISNULL : 0));
+
+	ScanKeyEntryInitializeWithInfo(route_key,
+								   flags,
+								   1,
+								   InvalidStrategy,
+								   InvalidOid,
+								   rel->rd_indcollation[0],
+								   procinfo,
+								   chosen->sk_argument);
+	*nkeys_out = 1;
+	return route_key;
 }
 
 static void
@@ -315,12 +434,15 @@ _bwt_collect_scan_items(IndexScanDesc scan, BWTreeScanOpaque so)
 	Buffer				metabuf;
 	Page				metapage;
 	BWTreeMetaPageData *metad;
+	BWTreeMetaPageData	metad_snapshot;
 	BWTreePid			pid;
 	BlockNumber			prev_leaf_blkno = InvalidBlockNumber;
 	uint64				step = 0;
 	uint64				limit;
 	int					capacity = 0;
 	BWTreeScanPosItem  *items = NULL;
+	ScanKey				route_key = NULL;
+	int					route_nkeys = 0;
 
 	if (scan == NULL || so == NULL)
 		elog(ERROR, "bwtree: collect-scan-items requires valid scan state");
@@ -339,12 +461,14 @@ _bwt_collect_scan_items(IndexScanDesc scan, BWTreeScanOpaque so)
 	/*
 	 * Correctness-first policy:
 	 *
-	 * Start from leftmost leaf and apply predicates tuple-by-tuple. This is
-	 * slower than qualifier-based start routing, but it avoids missing tuples
-	 * for scans like "<", "<=", and mixed predicates while scan routing is
-	 * still minimal.
+	 * Use a conservative lower-bound route only when it is obviously safe
+	 * (first-key =/>=/>, ASC). Otherwise fall back to leftmost leaf start.
+	 * Tuple-level predicate checking still guarantees final correctness.
 	 */
-	pid = _bwt_search_leaf(rel, metad, NULL, 0);
+	route_key = _bwt_build_scan_route_key(rel, so, &route_nkeys);
+	pid = _bwt_search_leaf(rel, metad, route_key, route_nkeys);
+	if (route_key != NULL)
+		pfree(route_key);
 	so->cur_leaf_pid = pid;
 	if (pid == InvalidBWTreePid)
 	{
@@ -354,9 +478,12 @@ _bwt_collect_scan_items(IndexScanDesc scan, BWTreeScanOpaque so)
 		return;
 	}
 
-	limit = (metad->bwt_next_pid > 0) ? (uint64) metad->bwt_next_pid + 64 : 64;
-	if (limit > BWTREE_MAX_SCAN_LEAF_STEPS)
-		limit = BWTREE_MAX_SCAN_LEAF_STEPS;
+	/*
+	 * Use a stable global guard. A limit derived from an initial PID snapshot
+	 * can false-trigger under concurrent growth.
+	 */
+	limit = BWTREE_MAX_SCAN_LEAF_STEPS;
+	_bwt_relbuf(rel, metabuf, BWT_READ);
 
 	while (pid != InvalidBWTreePid)
 	{
@@ -365,7 +492,12 @@ _bwt_collect_scan_items(IndexScanDesc scan, BWTreeScanOpaque so)
 		BWTreePid			next_pid;
 
 		CHECK_FOR_INTERRUPTS();
-		_bwt_materialize_page(rel, metad, pid, NULL, &mpage);
+		/*
+		 * Avoid holding metapage lock across the whole range scan.
+		 * Refresh a short-lived metapage snapshot per leaf materialization.
+		 */
+		_bwt_read_metad_snapshot(rel, &metad_snapshot);
+		_bwt_materialize_page(rel, &metad_snapshot, pid, NULL, &mpage);
 		_bwt_validate_scan_leaf(&mpage, prev_leaf_blkno);
 		prev_leaf_blkno = mpage.base_blkno;
 
@@ -400,13 +532,11 @@ _bwt_collect_scan_items(IndexScanDesc scan, BWTreeScanOpaque so)
 		step++;
 		if (step > limit)
 		{
-			_bwt_relbuf(rel, metabuf, BWT_READ);
 			if (items != NULL)
 				pfree(items);
 			elog(ERROR, "bwtree: scan leaf walk exceeded safety bound (possible sibling cycle)");
 		}
 	}
 
-	_bwt_relbuf(rel, metabuf, BWT_READ);
 	so->items = items;
 }

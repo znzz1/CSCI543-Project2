@@ -4,6 +4,8 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	bwtree.o \
+	bwtreeepoch.o \
+	bwtreegc.o \
 	bwtreedelta.o \
 	bwtreeinsert.o \
 	bwtreemap.o \

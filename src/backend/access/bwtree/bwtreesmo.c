@@ -1,9 +1,3 @@
-/*-------------------------------------------------------------------------
- *
- * bwtreesmo.c
- *    Structure-modification skeleton for the Bw-tree index.
- *
- *------------------------------------------------------------------------- */
 #include "postgres.h"
 
 #include <limits.h>
@@ -18,6 +12,14 @@
  * use tuple-count threshold (not byte-accurate free-space accounting).
  */
 #define BWTREE_LEAF_SPLIT_THRESHOLD	128
+/*
+ * Split materialization check is expensive; run periodically.
+ */
+#define BWTREE_SPLIT_CHECK_INTERVAL 4
+/*
+ * Avoid running expensive consolidation check on every insert.
+ */
+#define BWTREE_CONSOLIDATE_CHECK_INTERVAL 256
 
 static IndexTuple _bwt_copy_itup(IndexTuple src);
 static int	_bwt_tuple_keycmp(Relation rel, IndexTuple a, IndexTuple b);
@@ -27,13 +29,19 @@ static bool _bwt_try_fill_page_with_items(Page page, IndexTuple *items, int nite
 static bool _bwt_page_build_fits(BWTreePid pid, uint16 flags, uint32 level,
 								 BlockNumber prev_blkno, BlockNumber next_blkno,
 								 IndexTuple *items, int nitems);
+static bool _bwt_leaf_needs_split_fast(Relation rel, BWTreeMetaPageData *metad,
+									   BWTreePid pid);
 static bool _bwt_parent_has_child(Relation rel, BWTreeMetaPageData *metad,
 								  BWTreePid parent_pid, BWTreePid child_pid);
 static bool _bwt_find_parent_pid(Relation rel, BWTreeMetaPageData *metad,
 								 BWTreePid child_pid, BWTreePid *parent_pid_out);
 static BWTreePid _bwt_resolve_parent_pid(Relation rel, BWTreeMetaPageData *metad,
 										 BWTreePid child_pid, BWTreePid parent_hint);
-static void _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
+static bool _bwt_publish_base_without_delta(Relation rel, BWTreeMetaPageData *metad,
+											BWTreePid pid,
+											BlockNumber base_blkno,
+											BlockNumber expected_delta_blkno);
+static bool _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
 										   const BWTreeNodeSnapshot *snapshot,
 										   const BWTMaterializedPage *mpage,
 										   IndexTuple *items, int nitems,
@@ -44,6 +52,8 @@ static void _bwt_insert_into_internal(Relation rel, BWTreeMetaPageData *metad,
 static void _bwt_publish_split_metadata(Relation rel, BWTreeMetaPageData *metad,
 										BWTreePid split_pid, BWTreePid right_pid,
 										IndexTuple sep_itup);
+static uint32 bwtree_consolidate_check_counter = 0;
+static uint32 bwtree_split_check_counter = 0;
 
 static IndexTuple
 _bwt_copy_itup(IndexTuple src)
@@ -384,6 +394,62 @@ _bwt_resolve_parent_pid(Relation rel, BWTreeMetaPageData *metad,
 	return parent_pid;
 }
 
+static bool
+_bwt_publish_base_without_delta(Relation rel, BWTreeMetaPageData *metad,
+								BWTreePid pid,
+								BlockNumber base_blkno,
+								BlockNumber expected_delta_blkno)
+{
+	BlockNumber observed_base_blkno = InvalidBlockNumber;
+	BlockNumber observed_delta_blkno = InvalidBlockNumber;
+	bool		published;
+
+	published = _bwt_map_cas(rel, metad, pid,
+							 base_blkno, expected_delta_blkno,
+							 base_blkno, InvalidBlockNumber,
+							 &observed_base_blkno,
+							 &observed_delta_blkno);
+
+	if (!published)
+	{
+		/*
+		 * Already-published state is acceptable and idempotent.
+		 * Any other observed state means this stale snapshot cannot safely
+		 * publish; caller should restart from fresh snapshot.
+		 */
+		if (!(observed_base_blkno == base_blkno &&
+			  observed_delta_blkno == InvalidBlockNumber))
+			return false;
+		return true;
+	}
+
+	if (BlockNumberIsValid(expected_delta_blkno))
+	{
+		uint64	retire_epoch;
+
+		/*
+		 * Epoch-safety hardening:
+		 * capture retire epoch inside an explicit epoch section. If caller is
+		 * already in epoch this is a cheap nested enter/exit; if not, we still
+		 * guarantee safe retire timestamping.
+		 */
+		retire_epoch = _bwt_epoch_enter();
+		PG_TRY();
+		{
+			_bwt_gc_retire_delta_chain(rel, pid, expected_delta_blkno, retire_epoch);
+		}
+		PG_CATCH();
+		{
+			_bwt_epoch_exit();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		_bwt_epoch_exit();
+	}
+
+	return true;
+}
+
 static void
 _bwt_publish_split_metadata(Relation rel, BWTreeMetaPageData *metad,
 							BWTreePid split_pid, BWTreePid right_pid,
@@ -406,7 +472,7 @@ _bwt_publish_split_metadata(Relation rel, BWTreeMetaPageData *metad,
 	_bwt_delta_install(rel, metad, split_pid, BW_DELTA_SEPARATOR, sep_itup, right_pid);
 }
 
-static void
+static bool
 _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
 							   const BWTreeNodeSnapshot *snapshot,
 							   const BWTMaterializedPage *mpage,
@@ -424,6 +490,9 @@ _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
 	BWTreePid			right_pid;
 	BlockNumber			right_blkno;
 	IndexTuple			sep_itup;
+	bool				published;
+	BlockNumber			observed_base_blkno;
+	BlockNumber			observed_delta_blkno;
 
 	if (snapshot == NULL || mpage == NULL || items == NULL)
 		elog(ERROR, "bwtree: internal split requires valid inputs");
@@ -441,11 +510,34 @@ _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
 		split_at = nitems - 1;
 
 	/*
+	 * Correctness-first guard:
+	 * verify both split outputs fit a page before allocating any new PID/page.
+	 * This avoids leaving partially-published metadata on hard overflow paths.
+	 */
+	if (!_bwt_page_build_fits(snapshot->pid, 0, snapshot->level,
+							  mpage->prev_blkno, InvalidBlockNumber,
+							  items, split_at) ||
+		!_bwt_page_build_fits(InvalidBWTreePid, 0, snapshot->level,
+							  InvalidBlockNumber, mpage->next_blkno,
+							  &items[split_at], nitems - split_at))
+		elog(ERROR, "bwtree: internal split output does not fit page layout");
+
+	/*
 	 * Caller holds metapage write lock; take only a pin for map helpers.
 	 */
 	metabuf = _bwt_getbuf(rel, BWTREE_METAPAGE, BWT_NOLOCK);
 
 	leftbuf = _bwt_getbuf(rel, snapshot->base_blkno, BWT_WRITE);
+	if (!_bwt_map_lookup(rel, metad, snapshot->pid,
+						 &observed_base_blkno, &observed_delta_blkno) ||
+		observed_base_blkno != snapshot->base_blkno ||
+		observed_delta_blkno != snapshot->delta_blkno)
+	{
+		_bwt_relbuf(rel, leftbuf, BWT_WRITE);
+		_bwt_relbuf(rel, metabuf, BWT_NOLOCK);
+		return false;
+	}
+
 	rightbuf = _bwt_allocbuf(rel);
 	right_blkno = BufferGetBlockNumber(rightbuf);
 	right_pid = _bwt_map_alloc_pid(rel, metad, metabuf,
@@ -474,11 +566,21 @@ _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
 
 	MarkBufferDirty(leftbuf);
 	MarkBufferDirty(rightbuf);
-	_bwt_relbuf(rel, leftbuf, BWT_WRITE);
 	_bwt_relbuf(rel, rightbuf, BWT_WRITE);
 
-	_bwt_map_update(rel, metad, snapshot->pid,
-					snapshot->base_blkno, InvalidBlockNumber);
+	/*
+	 * Publish while holding left-base latch; this blocks concurrent
+	 * delta-head publication on the same base page.
+	 */
+	published = _bwt_publish_base_without_delta(rel, metad, snapshot->pid,
+												snapshot->base_blkno,
+												snapshot->delta_blkno);
+	_bwt_relbuf(rel, leftbuf, BWT_WRITE);
+	if (!published)
+	{
+		_bwt_relbuf(rel, metabuf, BWT_NOLOCK);
+		return false;
+	}
 
 	if (BlockNumberIsValid(mpage->next_blkno))
 	{
@@ -518,6 +620,7 @@ _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
 
 	pfree(sep_itup);
 	_bwt_relbuf(rel, metabuf, BWT_NOLOCK);
+	return true;
 }
 
 static void
@@ -525,95 +628,198 @@ _bwt_insert_into_internal(Relation rel, BWTreeMetaPageData *metad,
 						  BWTreePid pid, BWTreePid split_left_child_pid,
 						  IndexTuple new_itup)
 {
-	BWTreeNodeSnapshot	snapshot;
-	BWTMaterializedPage mpage;
-	IndexTuple		   *items;
-	IndexTuple			inserted_right;
-	IndexTuple			inserted_left;
-	int					total;
-	int					i;
-	Buffer				basebuf;
-	Page				basepage;
-	BWTreePageOpaque	base_opaque;
-	uint16				flags;
+	int retry;
 
 	if (new_itup == NULL)
 		elog(ERROR, "bwtree: internal insert requires separator tuple");
 	if (split_left_child_pid == InvalidBWTreePid)
 		elog(ERROR, "bwtree: internal insert requires split-left child PID");
 
-	if (!_bwt_capture_node_snapshot(rel, metad, pid, &snapshot))
-		elog(ERROR, "bwtree: internal insert cannot find PID %u",
-			 (unsigned int) pid);
-	if (snapshot.is_leaf)
-		elog(ERROR, "bwtree: internal insert called on leaf PID %u",
-			 (unsigned int) pid);
-
-	_bwt_materialize_page(rel, metad, pid, NULL, &mpage);
-	total = mpage.nitems + 2;
-	items = (IndexTuple *) palloc(sizeof(IndexTuple) * total);
-	for (i = 0; i < mpage.nitems; i++)
-		items[i] = mpage.items[i];
-
-	inserted_right = _bwt_copy_itup(new_itup);
-	inserted_left = _bwt_copy_itup(new_itup);
-	BWTreeTupleSetDownLink(inserted_left, split_left_child_pid);
-
-	/*
-	 * Correctness-first representation:
-	 * for each split boundary key K, insert two tuples:
-	 *   (K -> left_child), (K -> right_child)
-	 * This matches current search rule (pick last tuple <= key, fallback to
-	 * first tuple for key < min key) without needing a separate leftmost
-	 * downlink field.
-	 */
-	items[total - 2] = inserted_left;
-	items[total - 1] = inserted_right;
-	_bwt_sort_tuples(rel, items, total);
-
-	flags = snapshot.is_root ? BWT_ROOT : 0;
-
-	if (!_bwt_page_build_fits(pid, flags, snapshot.level,
-							  mpage.prev_blkno, mpage.next_blkno,
-							  items, total))
+	for (retry = 0; retry < 32; retry++)
 	{
+		BWTreeNodeSnapshot	snapshot;
+		BWTMaterializedPage mpage;
+		IndexTuple		   *items;
+		IndexTuple			inserted_right;
+		IndexTuple			inserted_left;
+		int					total;
+		int					i;
+		Buffer				basebuf;
+		Page				basepage;
+		BWTreePageOpaque	base_opaque;
+		uint16				flags;
+		bool				split_done;
+		bool				published;
+
+		if (!_bwt_capture_node_snapshot(rel, metad, pid, &snapshot))
+			elog(ERROR, "bwtree: internal insert cannot find PID %u",
+				 (unsigned int) pid);
+		if (snapshot.is_leaf)
+			elog(ERROR, "bwtree: internal insert called on leaf PID %u",
+				 (unsigned int) pid);
+
+		_bwt_materialize_page(rel, metad, pid, NULL, &mpage);
+		total = mpage.nitems + 2;
+		items = (IndexTuple *) palloc(sizeof(IndexTuple) * total);
+		for (i = 0; i < mpage.nitems; i++)
+			items[i] = mpage.items[i];
+
+		inserted_right = _bwt_copy_itup(new_itup);
+		inserted_left = _bwt_copy_itup(new_itup);
+		BWTreeTupleSetDownLink(inserted_left, split_left_child_pid);
+
 		/*
-		 * Recursive split propagation:
-		 * if parent page overflows, split it and push separator upward.
+		 * Correctness-first representation:
+		 * for each split boundary key K, insert two tuples:
+		 *   (K -> left_child), (K -> right_child)
+		 * This matches current search rule (pick last tuple <= key, fallback
+		 * to first tuple for key < min key).
 		 */
-		_bwt_split_internal_from_items(rel, metad, &snapshot, &mpage,
-									   items, total, InvalidBWTreePid);
+		items[total - 2] = inserted_left;
+		items[total - 1] = inserted_right;
+		_bwt_sort_tuples(rel, items, total);
+
+		flags = snapshot.is_root ? BWT_ROOT : 0;
+		if (!_bwt_page_build_fits(pid, flags, snapshot.level,
+								  mpage.prev_blkno, mpage.next_blkno,
+								  items, total))
+		{
+			/*
+			 * Recursive split propagation:
+			 * if parent page overflows, split it and push separator upward.
+			 * On stale publish conflict, retry from fresh snapshot.
+			 */
+			split_done = _bwt_split_internal_from_items(rel, metad, &snapshot, &mpage,
+														items, total, InvalidBWTreePid);
+			pfree(inserted_left);
+			pfree(inserted_right);
+			pfree(items);
+			_bwt_free_materialized_page(&mpage);
+			if (split_done)
+				return;
+			continue;
+		}
+
+		basebuf = _bwt_getbuf(rel, snapshot.base_blkno, BWT_WRITE);
+		basepage = BufferGetPage(basebuf);
+
+		/*
+		 * Correctness-first trade-off:
+		 * rewrite parent base page in-place and then clear delta head via CAS.
+		 */
+		_bwt_initpage(basepage, flags, pid, snapshot.level);
+		base_opaque = BWTreePageGetOpaque(basepage);
+		base_opaque->bwto_prev = mpage.prev_blkno;
+		base_opaque->bwto_next = mpage.next_blkno;
+		_bwt_fill_page_with_items(basepage, items, total);
+		MarkBufferDirty(basebuf);
+
+		/* Publish while base latch is still held. */
+		published = _bwt_publish_base_without_delta(rel, metad, pid,
+													snapshot.base_blkno,
+													snapshot.delta_blkno);
+		_bwt_relbuf(rel, basebuf, BWT_WRITE);
+
 		pfree(inserted_left);
 		pfree(inserted_right);
 		pfree(items);
 		_bwt_free_materialized_page(&mpage);
-		return;
+
+		if (published)
+			return;
 	}
 
-	basebuf = _bwt_getbuf(rel, snapshot.base_blkno, BWT_WRITE);
+	elog(ERROR, "bwtree: internal insert exceeded retry bound for PID %u",
+		 (unsigned int) pid);
+}
+
+static bool
+_bwt_leaf_needs_split_fast(Relation rel, BWTreeMetaPageData *metad, BWTreePid pid)
+{
+	BWTreeNodeSnapshot	snapshot;
+	Buffer				basebuf;
+	Page				basepage;
+	int					tuple_upper_bound;
+	BlockNumber			cur_blkno;
+	BlockNumber			rel_nblocks;
+	BlockNumber			hops = 0;
+	BlockNumber			hops_limit;
+
+	if (!_bwt_capture_node_snapshot(rel, metad, pid, &snapshot))
+		return false;
+	if (!snapshot.is_leaf)
+		return false;
+
+	basebuf = _bwt_getbuf(rel, snapshot.base_blkno, BWT_READ);
 	basepage = BufferGetPage(basebuf);
+	tuple_upper_bound = (int) PageGetMaxOffsetNumber(basepage);
+	_bwt_relbuf(rel, basebuf, BWT_READ);
 
-	/*
-	 * Correctness-first trade-off:
-	 *
-	 * We rewrite the parent base page in-place and clear its delta head
-	 * afterwards. This is simpler than delta-publishing separators and avoids
-	 * relying on incomplete separator-delta replay logic.
-	 */
-	_bwt_initpage(basepage, flags, pid, snapshot.level);
-	base_opaque = BWTreePageGetOpaque(basepage);
-	base_opaque->bwto_prev = mpage.prev_blkno;
-	base_opaque->bwto_next = mpage.next_blkno;
-	_bwt_fill_page_with_items(basepage, items, total);
-	MarkBufferDirty(basebuf);
-	_bwt_relbuf(rel, basebuf, BWT_WRITE);
+	if (tuple_upper_bound >= BWTREE_LEAF_SPLIT_THRESHOLD)
+		return true;
+	if (!BlockNumberIsValid(snapshot.delta_blkno))
+		return false;
 
-	_bwt_map_update(rel, metad, pid, snapshot.base_blkno, InvalidBlockNumber);
+	cur_blkno = snapshot.delta_blkno;
+	rel_nblocks = RelationGetNumberOfBlocks(rel);
+	hops_limit = rel_nblocks + 1;
 
-	pfree(inserted_left);
-	pfree(inserted_right);
-	pfree(items);
-	_bwt_free_materialized_page(&mpage);
+	while (BlockNumberIsValid(cur_blkno) &&
+		   tuple_upper_bound < BWTREE_LEAF_SPLIT_THRESHOLD)
+	{
+		Buffer					deltabuf;
+		Page					deltapage;
+		BWTreePageOpaque		delta_opaque;
+		OffsetNumber			maxoff;
+		BlockNumber				next_blkno;
+
+		if (cur_blkno >= rel_nblocks)
+			elog(ERROR, "bwtree: fast split check chain points outside relation (blk=%u nblocks=%u)",
+				 (unsigned int) cur_blkno,
+				 (unsigned int) rel_nblocks);
+
+		deltabuf = _bwt_getbuf(rel, cur_blkno, BWT_READ);
+		deltapage = BufferGetPage(deltabuf);
+		delta_opaque = BWTreePageGetOpaque(deltapage);
+		if (delta_opaque->bwto_page_id != BWTREE_PAGE_ID ||
+			!BWTreePageIsDelta(delta_opaque))
+		{
+			_bwt_relbuf(rel, deltabuf, BWT_READ);
+			elog(ERROR, "bwtree: fast split check encountered non-delta page in chain (blk=%u)",
+				 (unsigned int) cur_blkno);
+		}
+
+		maxoff = PageGetMaxOffsetNumber(deltapage);
+		if (maxoff >= FirstOffsetNumber)
+		{
+			ItemId					itemid;
+			BWTreeDeltaRecordData  *drec;
+
+			itemid = PageGetItemId(deltapage, FirstOffsetNumber);
+			if (ItemIdIsUsed(itemid))
+			{
+				drec = (BWTreeDeltaRecordData *) PageGetItem(deltapage, itemid);
+				/*
+				 * Conservative upper bound:
+				 * count only INSERT deltas and ignore DELETE deltas so we never
+				 * miss a required split (at worst we split early).
+				 */
+				if (drec->type == BW_DELTA_INSERT)
+					tuple_upper_bound++;
+			}
+		}
+
+		next_blkno = delta_opaque->bwto_next;
+		_bwt_relbuf(rel, deltabuf, BWT_READ);
+		cur_blkno = next_blkno;
+
+		hops++;
+		if (hops > hops_limit)
+			elog(ERROR, "bwtree: fast split check exceeded safety bound for PID %u",
+				 (unsigned int) pid);
+	}
+
+	return tuple_upper_bound >= BWTREE_LEAF_SPLIT_THRESHOLD;
 }
 
 bool
@@ -623,11 +829,11 @@ _bwt_prepare_split(Relation rel, BWTreeMetaPageData *metad,
 	if (view == NULL)
 		elog(ERROR, "bwtree: prepare-split requires node view output");
 
-	_bwt_materialize_node(rel, metad, pid, view);
-	if (!view->snapshot.is_leaf)
-		return false;
+	memset(view, 0, sizeof(*view));
+	view->split_right_pid = InvalidBWTreePid;
+	view->state = BWT_STATE_STABLE;
 
-	return (view->page.nitems >= BWTREE_LEAF_SPLIT_THRESHOLD);
+	return _bwt_leaf_needs_split_fast(rel, metad, pid);
 }
 
 void
@@ -716,13 +922,61 @@ _bwt_insert_item(Relation rel, BWTreeMetaPageData *metad,
 
 	_bwt_delta_install(rel, metad, pid, BW_DELTA_INSERT, itup, InvalidBWTreePid);
 
-	if (_bwt_should_consolidate(rel, metad, pid))
-		_bwt_consolidate(rel, metad, pid);
+	bwtree_split_check_counter++;
+	if ((bwtree_split_check_counter % BWTREE_SPLIT_CHECK_INTERVAL) != 0)
+		goto maybe_consolidate;
 
+	/*
+	 * Fast path:
+	 * split check without metapage write lock.
+	 */
 	need_split = _bwt_prepare_split(rel, metad, pid, &view);
 	if (need_split)
-		_bwt_finish_split(rel, metad, pid, parent_pid, &view);
+	{
+		Buffer				metabuf;
+		Page				metapage;
+		BWTreeMetaPageData *live_metad;
+		BWTreeNodeView		live_view;
+		bool				live_need_split;
+
+		_bwt_free_node_view(&view);
+
+		/*
+		 * Slow path:
+		 * take metapage write lock only when split publication is needed.
+		 */
+		metabuf = _bwt_getbuf(rel, BWTREE_METAPAGE, BWT_WRITE);
+		metapage = BufferGetPage(metabuf);
+		live_metad = BWTreeMetaPageGetData(metapage);
+		if (live_metad->bwt_magic != BWTREE_MAGIC ||
+			live_metad->bwt_version != BWTREE_VERSION)
+		{
+			_bwt_relbuf(rel, metabuf, BWT_WRITE);
+			elog(ERROR, "bwtree: invalid metapage (magic/version mismatch)");
+		}
+
+		/*
+		 * Re-check under write lock: concurrent insert may have already split.
+		 */
+		live_need_split = _bwt_prepare_split(rel, live_metad, pid, &live_view);
+		if (live_need_split)
+			_bwt_finish_split(rel, live_metad, pid, parent_pid, &live_view);
+		_bwt_free_node_view(&live_view);
+		_bwt_relbuf(rel, metabuf, BWT_WRITE);
+		return;
+	}
 	_bwt_free_node_view(&view);
+
+maybe_consolidate:
+	/*
+	 * Consolidation is expensive under contention. Check periodically and only
+	 * after split decision, so imminent split path is never delayed by
+	 * foreground consolidation.
+	 */
+	bwtree_consolidate_check_counter++;
+	if ((bwtree_consolidate_check_counter % BWTREE_CONSOLIDATE_CHECK_INTERVAL) == 0 &&
+		_bwt_should_consolidate(rel, metad, pid))
+		_bwt_consolidate(rel, metad, pid);
 }
 
 void
@@ -730,114 +984,186 @@ _bwt_split(Relation rel, BWTreeMetaPageData *metad,
 		   Buffer leafbuf, BWTreePid leaf_pid,
 		   BWTreePid parent_pid)
 {
-	BWTreeNodeSnapshot	snapshot;
-	BWTMaterializedPage mpage;
-	int					split_at;
-	Buffer				metabuf;
-	Buffer				leftbuf;
-	Buffer				rightbuf;
-	Page				leftpage;
-	Page				rightpage;
-	BWTreePageOpaque	left_opaque;
-	BWTreePageOpaque	right_opaque;
-	BWTreePid			right_pid;
-	BlockNumber			right_blkno;
-	IndexTuple			sep_itup;
+	int retry;
 
 	(void) leafbuf;
 
-	if (!_bwt_capture_node_snapshot(rel, metad, leaf_pid, &snapshot))
-		elog(ERROR, "bwtree: split cannot find leaf PID %u",
-			 (unsigned int) leaf_pid);
-	if (!snapshot.is_leaf)
-		elog(ERROR, "bwtree: split target PID %u is not a leaf",
-			 (unsigned int) leaf_pid);
-
-	_bwt_materialize_page(rel, metad, leaf_pid, NULL, &mpage);
-	if (mpage.nitems < 2)
+	for (retry = 0; retry < 32; retry++)
 	{
+		BWTreeNodeSnapshot	snapshot;
+		BWTMaterializedPage mpage;
+		int					split_at;
+		Buffer				metabuf;
+		Buffer				leftbuf;
+		Buffer				rightbuf;
+		Page				leftpage;
+		Page				rightpage;
+		BWTreePageOpaque	left_opaque;
+		BWTreePageOpaque	right_opaque;
+		BWTreePid			right_pid;
+		BlockNumber			right_blkno;
+		IndexTuple			sep_itup;
+		BlockNumber			observed_base_blkno;
+		BlockNumber			observed_delta_blkno;
+		bool				published;
+
+		if (!_bwt_capture_node_snapshot(rel, metad, leaf_pid, &snapshot))
+			elog(ERROR, "bwtree: split cannot find leaf PID %u",
+				 (unsigned int) leaf_pid);
+		if (!snapshot.is_leaf)
+			elog(ERROR, "bwtree: split target PID %u is not a leaf",
+				 (unsigned int) leaf_pid);
+
+		_bwt_materialize_page(rel, metad, leaf_pid, NULL, &mpage);
+		if (mpage.nitems < 2)
+		{
+			_bwt_free_materialized_page(&mpage);
+			return;
+		}
+
+		_bwt_sort_tuples(rel, mpage.items, mpage.nitems);
+		split_at = mpage.nitems / 2;
+		if (split_at <= 0)
+			split_at = 1;
+		if (split_at >= mpage.nitems)
+			split_at = mpage.nitems - 1;
+
+		/*
+		 * Correctness-first guard:
+		 * verify both split outputs fit before allocating new PID/page so we
+		 * never leak metadata on impossible-to-fit tuple layouts.
+		 */
+		if (!_bwt_page_build_fits(leaf_pid, BWT_LEAF, snapshot.level,
+								  mpage.prev_blkno, InvalidBlockNumber,
+								  mpage.items, split_at) ||
+			!_bwt_page_build_fits(InvalidBWTreePid, BWT_LEAF, snapshot.level,
+								  InvalidBlockNumber, mpage.next_blkno,
+								  &mpage.items[split_at], mpage.nitems - split_at))
+		{
+			_bwt_free_materialized_page(&mpage);
+			elog(ERROR, "bwtree: leaf split output does not fit page layout");
+		}
+
+		/*
+		 * Caller is expected to already hold metapage write lock; we pin only.
+		 */
+		metabuf = _bwt_getbuf(rel, BWTREE_METAPAGE, BWT_NOLOCK);
+
+		/*
+		 * Concurrency hardening:
+		 * hold left-base write latch before publish CAS. Delta install takes
+		 * base read latch first, so this blocks concurrent delta-head changes.
+		 */
+		leftbuf = _bwt_getbuf(rel, snapshot.base_blkno, BWT_WRITE);
+
+		/*
+		 * Validate that snapshot is still current after acquiring left latch.
+		 * If not, restart split from a fresh snapshot.
+		 */
+		if (!_bwt_map_lookup(rel, metad, leaf_pid,
+							 &observed_base_blkno, &observed_delta_blkno) ||
+			observed_base_blkno != snapshot.base_blkno ||
+			observed_delta_blkno != snapshot.delta_blkno)
+		{
+			_bwt_relbuf(rel, leftbuf, BWT_WRITE);
+			_bwt_relbuf(rel, metabuf, BWT_NOLOCK);
+			_bwt_free_materialized_page(&mpage);
+			continue;
+		}
+
+		rightbuf = _bwt_allocbuf(rel);
+		right_blkno = BufferGetBlockNumber(rightbuf);
+		right_pid = _bwt_map_alloc_pid(rel, metad, metabuf,
+									   right_blkno, InvalidBlockNumber);
+
+		leftpage = BufferGetPage(leftbuf);
+		rightpage = BufferGetPage(rightbuf);
+		/*
+		 * Mark left base as split-pending; this is a control hint for future
+		 * routing refinements and does not affect current correctness paths.
+		 */
+		_bwt_initpage(leftpage, BWT_LEAF | BWT_SPLIT_PENDING, leaf_pid, snapshot.level);
+		_bwt_initpage(rightpage, BWT_LEAF, right_pid, snapshot.level);
+
+		left_opaque = BWTreePageGetOpaque(leftpage);
+		right_opaque = BWTreePageGetOpaque(rightpage);
+		left_opaque->bwto_prev = mpage.prev_blkno;
+		left_opaque->bwto_next = right_blkno;
+		right_opaque->bwto_prev = snapshot.base_blkno;
+		right_opaque->bwto_next = mpage.next_blkno;
+
+		_bwt_fill_page_with_items(leftpage, mpage.items, split_at);
+		_bwt_fill_page_with_items(rightpage, &mpage.items[split_at],
+								  mpage.nitems - split_at);
+
+		MarkBufferDirty(leftbuf);
+		MarkBufferDirty(rightbuf);
+		_bwt_relbuf(rel, rightbuf, BWT_WRITE);
+
+		/* Publish while left-base latch is still held. */
+		published = _bwt_publish_base_without_delta(rel, metad, leaf_pid,
+													snapshot.base_blkno,
+													snapshot.delta_blkno);
+		_bwt_relbuf(rel, leftbuf, BWT_WRITE);
+		if (!published)
+		{
+			_bwt_free_materialized_page(&mpage);
+			_bwt_relbuf(rel, metabuf, BWT_NOLOCK);
+			continue;
+		}
+
+		if (BlockNumberIsValid(mpage.next_blkno))
+		{
+			Buffer			nextbuf;
+			Page			nextpage;
+			BWTreePageOpaque next_opaque;
+
+			nextbuf = _bwt_getbuf(rel, mpage.next_blkno, BWT_WRITE);
+			nextpage = BufferGetPage(nextbuf);
+			next_opaque = BWTreePageGetOpaque(nextpage);
+			if (next_opaque->bwto_page_id == BWTREE_PAGE_ID)
+			{
+				next_opaque->bwto_prev = right_blkno;
+				MarkBufferDirty(nextbuf);
+			}
+			_bwt_relbuf(rel, nextbuf, BWT_WRITE);
+		}
+
+		sep_itup = _bwt_copy_itup(mpage.items[split_at]);
+		BWTreeTupleSetDownLink(sep_itup, right_pid);
+		_bwt_publish_split_metadata(rel, metad, leaf_pid, right_pid, sep_itup);
+
+		if (parent_pid == InvalidBWTreePid)
+			_bwt_install_new_root(rel, metad, leaf_pid, right_pid, sep_itup,
+								  snapshot.level);
+		else
+		{
+			BWTreePid	effective_parent;
+
+			/*
+			 * Parent hint may become stale between route time and split
+			 * publication. Re-resolve under metapage write lock before
+			 * installing separator into internal level.
+			 */
+			effective_parent = _bwt_resolve_parent_pid(rel, metad,
+													   leaf_pid, parent_pid);
+
+			/*
+			 * Correctness-first trade-off:
+			 *
+			 * Parent update is currently performed via full parent-base rewrite
+			 * (through _bwt_insert_item with is_leaf=false), not separator delta.
+			 */
+			_bwt_insert_item(rel, metad, effective_parent, leaf_pid,
+							 sep_itup, false);
+		}
+
+		pfree(sep_itup);
 		_bwt_free_materialized_page(&mpage);
+		_bwt_relbuf(rel, metabuf, BWT_NOLOCK);
 		return;
 	}
 
-	_bwt_sort_tuples(rel, mpage.items, mpage.nitems);
-	split_at = mpage.nitems / 2;
-	if (split_at <= 0)
-		split_at = 1;
-	if (split_at >= mpage.nitems)
-		split_at = mpage.nitems - 1;
-
-	/*
-	 * Caller is expected to already hold metapage write lock; we pin only.
-	 */
-	metabuf = _bwt_getbuf(rel, BWTREE_METAPAGE, BWT_NOLOCK);
-
-	leftbuf = _bwt_getbuf(rel, snapshot.base_blkno, BWT_WRITE);
-	rightbuf = _bwt_allocbuf(rel);
-	right_blkno = BufferGetBlockNumber(rightbuf);
-	right_pid = _bwt_map_alloc_pid(rel, metad, metabuf,
-								   right_blkno, InvalidBlockNumber);
-
-	leftpage = BufferGetPage(leftbuf);
-	rightpage = BufferGetPage(rightbuf);
-	_bwt_initpage(leftpage, BWT_LEAF, leaf_pid, snapshot.level);
-	_bwt_initpage(rightpage, BWT_LEAF, right_pid, snapshot.level);
-
-	left_opaque = BWTreePageGetOpaque(leftpage);
-	right_opaque = BWTreePageGetOpaque(rightpage);
-	left_opaque->bwto_prev = mpage.prev_blkno;
-	left_opaque->bwto_next = right_blkno;
-	right_opaque->bwto_prev = snapshot.base_blkno;
-	right_opaque->bwto_next = mpage.next_blkno;
-
-	_bwt_fill_page_with_items(leftpage, mpage.items, split_at);
-	_bwt_fill_page_with_items(rightpage, &mpage.items[split_at],
-							  mpage.nitems - split_at);
-
-	MarkBufferDirty(leftbuf);
-	MarkBufferDirty(rightbuf);
-	_bwt_relbuf(rel, leftbuf, BWT_WRITE);
-	_bwt_relbuf(rel, rightbuf, BWT_WRITE);
-
-	_bwt_map_update(rel, metad, leaf_pid, snapshot.base_blkno, InvalidBlockNumber);
-
-	if (BlockNumberIsValid(mpage.next_blkno))
-	{
-		Buffer			nextbuf;
-		Page			nextpage;
-		BWTreePageOpaque next_opaque;
-
-		nextbuf = _bwt_getbuf(rel, mpage.next_blkno, BWT_WRITE);
-		nextpage = BufferGetPage(nextbuf);
-		next_opaque = BWTreePageGetOpaque(nextpage);
-		if (next_opaque->bwto_page_id == BWTREE_PAGE_ID)
-		{
-			next_opaque->bwto_prev = right_blkno;
-			MarkBufferDirty(nextbuf);
-		}
-		_bwt_relbuf(rel, nextbuf, BWT_WRITE);
-	}
-
-	sep_itup = _bwt_copy_itup(mpage.items[split_at]);
-	BWTreeTupleSetDownLink(sep_itup, right_pid);
-	_bwt_publish_split_metadata(rel, metad, leaf_pid, right_pid, sep_itup);
-
-	if (parent_pid == InvalidBWTreePid)
-		_bwt_install_new_root(rel, metad, leaf_pid, right_pid, sep_itup,
-							  snapshot.level);
-	else
-	{
-		/*
-		 * Correctness-first trade-off:
-		 *
-		 * Parent update is currently performed via full parent-base rewrite
-		 * (through _bwt_insert_item with is_leaf=false), not separator delta.
-		 */
-		_bwt_insert_item(rel, metad, parent_pid, leaf_pid,
-						 sep_itup, false);
-	}
-
-	pfree(sep_itup);
-	_bwt_free_materialized_page(&mpage);
-	_bwt_relbuf(rel, metabuf, BWT_NOLOCK);
+	elog(ERROR, "bwtree: split exceeded retry bound for PID %u",
+		 (unsigned int) leaf_pid);
 }
