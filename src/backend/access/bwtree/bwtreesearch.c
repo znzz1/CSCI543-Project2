@@ -19,16 +19,6 @@ static bool _bwt_leaf_should_move_right_fast(Relation rel,
 											 BWTreePid *right_pid_out);
 static bool _bwt_should_move_right(Relation rel, ScanKey scankey, int nkeys,
 								   const BWTreeNodeView *view);
-static void _bwt_validate_right_sibling_snapshot(Relation rel,
-												 BWTreeMetaPageData *metad,
-												 const BWTreeNodeSnapshot *left_snapshot,
-												 BWTreePid right_pid);
-static void _bwt_validate_right_sibling(Relation rel, BWTreeMetaPageData *metad,
-										const BWTreeNodeView *view,
-										BWTreePid right_pid);
-static void _bwt_validate_child_link(Relation rel, BWTreeMetaPageData *metad,
-									 const BWTreeNodeView *parent_view,
-									 BWTreePid child_pid);
 static void _bwt_push_pid(BWTreeContext *ctx, BWTreePid pid);
 
 void
@@ -153,9 +143,6 @@ _bwt_descend_to_leaf(Relation rel, BWTreeMetaPageData *metad,
 												 scankey, nkeys,
 												 &split_right_pid))
 			{
-				_bwt_validate_right_sibling_snapshot(rel, metad,
-													 &cur_snapshot,
-													 split_right_pid);
 				cur_pid = split_right_pid;
 				continue;
 			}
@@ -181,7 +168,6 @@ _bwt_descend_to_leaf(Relation rel, BWTreeMetaPageData *metad,
 			 */
 			if (_bwt_should_move_right(rel, scankey, nkeys, &view))
 			{
-				_bwt_validate_right_sibling(rel, metad, &view, view.split_right_pid);
 				cur_pid = view.split_right_pid;
 				_bwt_free_node_view(&view);
 				continue;
@@ -189,7 +175,6 @@ _bwt_descend_to_leaf(Relation rel, BWTreeMetaPageData *metad,
 
 			_bwt_push_pid(ctx, cur_pid);
 			next_pid = _bwt_choose_child_pid(rel, scankey, nkeys, &view);
-			_bwt_validate_child_link(rel, metad, &view, next_pid);
 			cur_pid = next_pid;
 			_bwt_free_node_view(&view);
 		}
@@ -331,6 +316,8 @@ _bwt_leaf_should_move_right_fast(Relation rel,
 		return false;
 	if (!snapshot->is_leaf)
 		return false;
+	if ((snapshot->flags & BWT_SPLIT_PENDING) == 0)
+		return false;
 	if (!BlockNumberIsValid(snapshot->delta_blkno))
 		return false;
 	if (scankey == NULL || nkeys <= 0)
@@ -432,93 +419,6 @@ _bwt_should_move_right(Relation rel, ScanKey scankey, int nkeys,
 		return false;
 
 	return (_bwt_compare_tuple(rel, scankey, nkeys, view->split_separator) >= 0);
-}
-
-static void
-_bwt_validate_right_sibling_snapshot(Relation rel, BWTreeMetaPageData *metad,
-									 const BWTreeNodeSnapshot *left_snapshot,
-									 BWTreePid right_pid)
-{
-	BWTreeNodeSnapshot	right_snapshot;
-
-	if (left_snapshot == NULL || metad == NULL)
-		elog(ERROR, "bwtree: validate-right-sibling-snapshot requires valid inputs");
-	if (right_pid == InvalidBWTreePid || right_pid >= metad->bwt_next_pid)
-		elog(ERROR, "bwtree: invalid split right PID %u from PID %u",
-			 (unsigned int) right_pid,
-			 (unsigned int) ((left_snapshot != NULL) ?
-							 left_snapshot->pid : InvalidBWTreePid));
-	if (right_pid == left_snapshot->pid)
-		elog(ERROR, "bwtree: split right PID equals source PID %u",
-			 (unsigned int) right_pid);
-	if (!_bwt_capture_node_snapshot(rel, metad, right_pid, &right_snapshot))
-		elog(ERROR, "bwtree: split right PID %u is not mapped",
-			 (unsigned int) right_pid);
-	if (right_snapshot.level != left_snapshot->level)
-		elog(ERROR, "bwtree: split sibling level mismatch: left level %u right level %u",
-			 (unsigned int) left_snapshot->level,
-			 (unsigned int) right_snapshot.level);
-	if (right_snapshot.is_leaf != left_snapshot->is_leaf)
-		elog(ERROR, "bwtree: split sibling leaf flag mismatch for PID %u -> %u",
-			 (unsigned int) left_snapshot->pid,
-			 (unsigned int) right_pid);
-}
-
-static void
-_bwt_validate_right_sibling(Relation rel, BWTreeMetaPageData *metad,
-							const BWTreeNodeView *view,
-							BWTreePid right_pid)
-{
-	BWTreeNodeSnapshot	right_snapshot;
-
-	if (view == NULL || metad == NULL)
-		elog(ERROR, "bwtree: validate-right-sibling requires valid inputs");
-	if (right_pid == InvalidBWTreePid || right_pid >= metad->bwt_next_pid)
-		elog(ERROR, "bwtree: invalid split right PID %u from PID %u",
-			 (unsigned int) right_pid,
-			 (unsigned int) ((view != NULL) ? view->snapshot.pid : InvalidBWTreePid));
-	if (right_pid == view->snapshot.pid)
-		elog(ERROR, "bwtree: split right PID equals source PID %u",
-			 (unsigned int) right_pid);
-	if (!_bwt_capture_node_snapshot(rel, metad, right_pid, &right_snapshot))
-		elog(ERROR, "bwtree: split right PID %u is not mapped",
-			 (unsigned int) right_pid);
-	if (right_snapshot.level != view->snapshot.level)
-		elog(ERROR, "bwtree: split sibling level mismatch: left level %u right level %u",
-			 (unsigned int) view->snapshot.level,
-			 (unsigned int) right_snapshot.level);
-	if (right_snapshot.is_leaf != view->snapshot.is_leaf)
-		elog(ERROR, "bwtree: split sibling leaf flag mismatch for PID %u -> %u",
-			 (unsigned int) view->snapshot.pid,
-			 (unsigned int) right_pid);
-}
-
-static void
-_bwt_validate_child_link(Relation rel, BWTreeMetaPageData *metad,
-						 const BWTreeNodeView *parent_view,
-						 BWTreePid child_pid)
-{
-	BWTreeNodeSnapshot	child_snapshot;
-
-	if (parent_view == NULL || metad == NULL)
-		elog(ERROR, "bwtree: validate-child-link requires valid inputs");
-	if (child_pid == InvalidBWTreePid || child_pid >= metad->bwt_next_pid)
-		elog(ERROR, "bwtree: internal PID %u chose invalid child PID %u",
-			 (unsigned int) parent_view->snapshot.pid,
-			 (unsigned int) child_pid);
-	if (!_bwt_capture_node_snapshot(rel, metad, child_pid, &child_snapshot))
-		elog(ERROR, "bwtree: internal PID %u child PID %u is not mapped",
-			 (unsigned int) parent_view->snapshot.pid,
-			 (unsigned int) child_pid);
-	if (parent_view->snapshot.level == 0)
-		elog(ERROR, "bwtree: internal PID %u has invalid level 0",
-			 (unsigned int) parent_view->snapshot.pid);
-	if (child_snapshot.level + 1 != parent_view->snapshot.level)
-		elog(ERROR, "bwtree: level mismatch parent PID %u (L%u) child PID %u (L%u)",
-			 (unsigned int) parent_view->snapshot.pid,
-			 (unsigned int) parent_view->snapshot.level,
-			 (unsigned int) child_pid,
-			 (unsigned int) child_snapshot.level);
 }
 
 static BWTreePid

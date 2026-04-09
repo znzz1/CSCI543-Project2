@@ -7,7 +7,7 @@
 #include "storage/shmem.h"
 #include "storage/spin.h"
 
-#define BWT_GC_RECLAIM_BUDGET		32
+#define BWT_GC_RECLAIM_BUDGET		64
 /*
  * Shared retire queue capacity.
  *
@@ -16,7 +16,7 @@
  * bursty retire traffic, while keeping implementation simple.
  */
 #define BWT_GC_SHARED_RETIRE_CAP	65536
-#define BWT_GC_EAGER_RECLAIM_INTERVAL 128
+#define BWT_GC_EAGER_RECLAIM_INTERVAL 4096
 
 typedef struct BWTreeGCRetiredEntry
 {
@@ -73,6 +73,8 @@ static uint32 _bwt_gc_shared_count(void);
 static bool _bwt_gc_should_run(void);
 static bool _bwt_gc_local_entry_matches_rel(Relation rel,
 											 const BWTreeGCRetiredEntry *entry);
+static bool _bwt_gc_epoch_visible_reclaimable(uint64 retire_epoch,
+											   uint64 min_active_epoch);
 
 Size BwTreeGCShmemSize(void)
 {
@@ -138,12 +140,14 @@ _bwt_gc_shared_pop_if_reclaimable(Relation rel,
 {
 	BWTreeGCSharedState *shared;
 	Oid					relid;
+	uint64				min_active_epoch;
 	uint32				scan;
 	uint32				scan_limit;
 
 	if (rel == NULL || obj == NULL || retire_epoch == NULL)
 		return false;
 	relid = RelationGetRelid(rel);
+	min_active_epoch = _bwt_epoch_min_active();
 
 	shared = _bwt_gc_get_shared();
 	SpinLockAcquire(&shared->mutex);
@@ -165,7 +169,8 @@ _bwt_gc_shared_pop_if_reclaimable(Relation rel,
 
 		entry = shared->entries[shared->head];
 		if (entry.obj.relid == relid &&
-			_bwt_epoch_can_reclaim(entry.retire_epoch))
+			_bwt_gc_epoch_visible_reclaimable(entry.retire_epoch,
+											  min_active_epoch))
 		{
 			shared->head = (shared->head + 1) % BWT_GC_SHARED_RETIRE_CAP;
 			shared->count--;
@@ -459,6 +464,15 @@ static bool _bwt_gc_should_run(void)
 		return true;
 
 	return (_bwt_gc_shared_count() > 0);
+}
+
+static bool
+_bwt_gc_epoch_visible_reclaimable(uint64 retire_epoch, uint64 min_active_epoch)
+{
+	if (min_active_epoch == PG_UINT64_MAX)
+		return true;
+
+	return retire_epoch < min_active_epoch;
 }
 
 void _bwt_gc_init(void)

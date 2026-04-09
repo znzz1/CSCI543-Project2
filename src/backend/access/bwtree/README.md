@@ -9,6 +9,16 @@ concurrency before optimizing for peak throughput.
 
 ---
 
+## 0. Version and Compatibility Notice
+
+- Current on-disk metadata version is `BWTREE_VERSION = 2`.
+- Mapping-table density/layout was changed to spread hot PIDs across more
+  mapping pages.
+- Rebuild BwTree indexes after upgrading to this version; old on-disk layouts
+  are not intended to be reused across this change.
+
+---
+
 ## 1. What This Module Is Responsible For
 
 ### In Scope (Implemented)
@@ -24,8 +34,17 @@ concurrency before optimizing for peak throughput.
 ### Out of Scope / Not Fully Implemented Yet
 
 - Full `UNIQUE` index semantics.
+- Full SQL delete/vacuum pruning parity with PostgreSQL nbtree.
 - Full paper-level lock-free optimization profile.
 - Production-level delete/vacuum integration parity.
+- Ordered scan features (`ORDER BY` / backward scan / orderby-op scans).
+- Scan-key extensions such as row-comparison and array-search scan keys.
+
+Current behavior behind those gaps:
+
+- `bwtreeinsert()` rejects non-`UNIQUE_CHECK_NO` inserts.
+- `bwtreebulkdelete()` / `bwtreevacuumcleanup()` run maintenance bookkeeping
+  only; dead-index-tuple pruning callback flow is not implemented yet.
 
 ---
 
@@ -248,6 +267,8 @@ GC engine:
 ### 6.2 CAS Publish
 
 - Mapping transitions use atomic CAS on packed map entries.
+- CAS publish uses a single-pass write-latched path so successful updates can
+  call `MarkBufferDirty()` under PostgreSQL buffer-manager lock rules.
 - Writers retry on stale expected state.
 - Retry outcomes are interpreted carefully:
   - idempotent already-published state is accepted,
@@ -320,8 +341,12 @@ These checks are intentional and prioritized over silent recovery.
 ## 10. Current Trade-offs
 
 - Some operations are serialized more than ideal (correctness first).
-- Extra materialization/revalidation can reduce throughput under high write concurrency.
+- Mapping-page write latches are still a major contention source at high client counts.
+- Split retries can leave unreachable preallocated pages/PIDs in rare races
+  (space/perf cost, not a logical read/write correctness violation).
 - GC and consolidation policies are conservative to reduce correctness risk.
+- Materialization was optimized to use one backing-page copy plus tuple
+  pointers (instead of per-tuple deep-copy), reducing scan/search allocation overhead.
 
 ---
 
@@ -362,7 +387,31 @@ Acceptance baseline for correctness:
 
 ---
 
-## 13. Quick Navigation
+## 13. Performance Evaluation Quick Start (100k Baseline)
+
+Recommended baseline for BwTree vs nbtree:
+
+- Workloads: `Insert-only` and `Read-Modify-Write`.
+- Initial rows: `100,000`.
+- Concurrency points: `1, 8, 16, 32, 64`.
+- Metrics: `latency average`, `TPS`, and `ERROR/WARNING/aborted` logs.
+
+Minimal workflow:
+
+1. Create a fresh database and load identical data into two tables.
+2. Build `USING bwtree` on one table and `USING btree` on the other.
+3. Run `pgbench -M prepared` for each workload/client-count pair.
+4. Collect per-run logs and extract latency/TPS summary lines.
+5. Always grep logs for warnings/errors before trusting throughput numbers.
+
+Important:
+
+- Recreate indexes after structural/version changes (especially mapping layout
+  updates), otherwise performance and correctness comparisons may be invalid.
+
+---
+
+## 14. Quick Navigation
 
 - Public API/types: `src/include/access/bwtree.h`
 - AM callback wiring: `bwtree.c`

@@ -11,15 +11,15 @@
  * Correctness-first split trigger:
  * use tuple-count threshold (not byte-accurate free-space accounting).
  */
-#define BWTREE_LEAF_SPLIT_THRESHOLD	128
+#define BWTREE_LEAF_SPLIT_THRESHOLD	256
 /*
  * Split materialization check is expensive; run periodically.
  */
-#define BWTREE_SPLIT_CHECK_INTERVAL 4
+#define BWTREE_SPLIT_CHECK_INTERVAL 32
 /*
  * Avoid running expensive consolidation check on every insert.
  */
-#define BWTREE_CONSOLIDATE_CHECK_INTERVAL 256
+#define BWTREE_CONSOLIDATE_CHECK_INTERVAL 4096
 
 static IndexTuple _bwt_copy_itup(IndexTuple src);
 static int	_bwt_tuple_keycmp(Relation rel, IndexTuple a, IndexTuple b);
@@ -545,7 +545,7 @@ _bwt_split_internal_from_items(Relation rel, BWTreeMetaPageData *metad,
 
 	leftpage = BufferGetPage(leftbuf);
 	rightpage = BufferGetPage(rightbuf);
-	_bwt_initpage(leftpage, 0, snapshot->pid, snapshot->level);
+	_bwt_initpage(leftpage, BWT_SPLIT_PENDING, snapshot->pid, snapshot->level);
 	_bwt_initpage(rightpage, 0, right_pid, snapshot->level);
 
 	left_opaque = BWTreePageGetOpaque(leftpage);

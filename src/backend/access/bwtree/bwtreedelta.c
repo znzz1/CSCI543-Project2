@@ -123,32 +123,20 @@ _bwt_collect_page_items(Page page, BWTMaterializedPage *mpage)
 		return;
 	}
 
-	/*
-	 * Correctness-first trade-off:
-	 *
-	 * Materialization deep-copies tuples into palloc memory to avoid exposing
-	 * buffer-backed tuple pointers to callers. This is safer but uses more
-	 * CPU and memory than zero-copy views.
-	 */
 	mpage->items = (IndexTuple *) palloc0(sizeof(IndexTuple) * capacity);
 	mpage->nitems = 0;
 
 	for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 	{
 		ItemId		itemid;
-		IndexTuple	src;
-		IndexTuple	dst;
-		Size		sz;
+		IndexTuple	itup;
 
 		itemid = PageGetItemId(page, off);
 		if (!ItemIdIsUsed(itemid))
 			continue;
 
-		src = (IndexTuple) PageGetItem(page, itemid);
-		sz = IndexTupleSize(src);
-		dst = (IndexTuple) palloc(sz);
-		memcpy(dst, src, sz);
-		mpage->items[mpage->nitems++] = dst;
+		itup = (IndexTuple) PageGetItem(page, itemid);
+		mpage->items[mpage->nitems++] = itup;
 	}
 }
 
@@ -176,6 +164,7 @@ _bwt_materialize_from_snapshot(Relation rel,
 	if (BlockNumberIsValid(snapshot->delta_blkno))
 		_bwt_delta_apply(rel, snapshot->delta_blkno, workpage, NULL);
 
+	mpage->backing_page = workpage;
 	work_opaque = BWTreePageGetOpaque(workpage);
 	mpage->base_blkno = snapshot->base_blkno;
 	mpage->prev_blkno = work_opaque->bwto_prev;
@@ -184,7 +173,6 @@ _bwt_materialize_from_snapshot(Relation rel,
 	mpage->level = work_opaque->bwto_level;
 
 	_bwt_collect_page_items(workpage, mpage);
-	pfree(workpage);
 	_bwt_relbuf(rel, basebuf, BWT_READ);
 }
 
@@ -603,20 +591,13 @@ _bwt_materialize_page(Relation rel, BWTreeMetaPageData *metad,
 void
 _bwt_free_materialized_page(BWTMaterializedPage *mpage)
 {
-	int	i;
-
 	if (mpage == NULL)
 		return;
 
 	if (mpage->items != NULL)
-	{
-		for (i = 0; i < mpage->nitems; i++)
-		{
-			if (mpage->items[i] != NULL)
-				pfree(mpage->items[i]);
-		}
 		pfree(mpage->items);
-	}
+	if (mpage->backing_page != NULL)
+		pfree(mpage->backing_page);
 
 	memset(mpage, 0, sizeof(*mpage));
 }
@@ -641,6 +622,10 @@ _bwt_materialize_node(Relation rel, BWTreeMetaPageData *metad,
 		elog(ERROR, "bwtree: cannot materialize unknown PID %u",
 			 (unsigned int) pid);
 	_bwt_materialize_from_snapshot(rel, &view->snapshot, &view->page);
+
+	if (!BlockNumberIsValid(view->snapshot.delta_blkno) ||
+		(view->snapshot.flags & BWT_SPLIT_PENDING) == 0)
+		return;
 
 	cur_blkno = view->snapshot.delta_blkno;
 	rel_nblocks = RelationGetNumberOfBlocks(rel);

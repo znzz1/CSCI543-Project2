@@ -6,7 +6,7 @@
 #include "access/skey.h"
 #include "nodes/execnodes.h"
 
-#define BWTREE_INSERT_GC_INTERVAL 128
+#define BWTREE_INSERT_GC_INTERVAL 4096
 
 static ScanKey
 _bwt_build_insert_scankey(Relation rel, Datum *values, bool *isnull, int *nkeys_out)

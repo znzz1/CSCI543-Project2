@@ -35,7 +35,7 @@
  * ---------------------------------------------------------------- */
 
 #define BWTREE_MAGIC        0x42575452
-#define BWTREE_VERSION      1
+#define BWTREE_VERSION      2
 #define BWTREE_METAPAGE     0
 #define BWTREE_PAGE_ID      0xFF90
 
@@ -59,8 +59,9 @@
  * Correctness-first + practical performance balance:
  * avoid consolidating on every single delta install.
  */
-#define BWTREE_DELTA_CHAIN_THRESHOLD    128
-#define BWTREE_MAX_MAP_PAGES            200
+#define BWTREE_DELTA_CHAIN_THRESHOLD    256
+#define BWTREE_MAX_MAP_PAGES            1600
+#define BWTREE_MAP_ENTRY_DENSITY_DIVISOR 8
 
 /* ----------------------------------------------------------------
  *  Logical page identifier
@@ -85,6 +86,10 @@ typedef struct BWTreeMetaPageData
 	BlockNumber bwt_map_blknos[BWTREE_MAX_MAP_PAGES];
 } BWTreeMetaPageData;
 
+StaticAssertDecl(sizeof(BWTreeMetaPageData) <=
+				 (BLCKSZ - MAXALIGN(SizeOfPageHeaderData)),
+				 "BWTree metapage layout must fit one page");
+
 #define BWTreeMetaPageGetData(page) \
 	((BWTreeMetaPageData *) PageGetContents(page))
 
@@ -103,7 +108,8 @@ typedef struct BWTreeMapEntry
 } BWTreeMapEntry;
 
 #define BWTREE_MAP_ENTRIES_PER_PAGE \
-	((int)((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) / sizeof(BWTreeMapEntry)))
+	((int)(((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) / sizeof(BWTreeMapEntry)) / \
+		   BWTREE_MAP_ENTRY_DENSITY_DIVISOR))
 
 #define BWTreeMapPageGetEntries(page) \
 	((BWTreeMapEntry *) PageGetContents(page))
@@ -182,6 +188,11 @@ typedef struct BWTreeScanOpaqueData
 {
 	bool        started;
 	BWTreePid   cur_leaf_pid;
+	uint64		leaf_walk_steps;
+	bool		has_lower_bound;
+	bool		has_upper_bound;
+	ScanKeyData	lower_bound;
+	ScanKeyData	upper_bound;
 	int         cur_item;
 	int         num_items;
 	BWTreeScanPosItem *items;
@@ -197,6 +208,7 @@ typedef struct BWTMaterializedPage
 {
 	IndexTuple *items;
 	int			nitems;
+	Page		backing_page;
 	BlockNumber base_blkno;
 	BlockNumber prev_blkno;
 	BlockNumber next_blkno;

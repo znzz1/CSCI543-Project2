@@ -28,6 +28,8 @@ static volatile pg_atomic_uint64 *_bwt_map_entry_atomic_slot(BWTreeMapEntry *ent
 {
 	StaticAssertDecl(sizeof(BWTreeMapEntry) == sizeof(uint64),
 					 "BWTreeMapEntry must be 64-bit wide for CAS publish");
+	StaticAssertDecl(BWTREE_MAP_ENTRIES_PER_PAGE > 0,
+					 "BWTree mapping page must hold at least one entry");
 
 	return (volatile pg_atomic_uint64 *) entry;
 }
@@ -141,6 +143,7 @@ _bwt_map_cas(Relation rel, BWTreeMetaPageData *metad, BWTreePid pid,
 	Page						page;
 	BWTreeMapEntry			   *entries;
 	volatile pg_atomic_uint64  *slot;
+	uint64						cur_packed;
 	uint64						expected_packed;
 	uint64						desired_packed;
 	bool						ok;
@@ -160,20 +163,42 @@ _bwt_map_cas(Relation rel, BWTreeMetaPageData *metad, BWTreePid pid,
 		elog(ERROR, "bwtree: map page %d has invalid block number",
 			 map_page_idx);
 
+	expected_packed = _bwt_map_pack_entry(expected_base_blkno,
+										  expected_delta_blkno);
+	desired_packed = _bwt_map_pack_entry(new_base_blkno, new_delta_blkno);
+
 	/*
-	 * Correctness-first CAS publish:
+	 * Mapping-page write latch serialization is still required because a
+	 * successful publish must call MarkBufferDirty() under content lock.
 	 *
-	 * Hold mapping-page content lock while doing CAS+dirty-mark so page
-	 * mutation follows PostgreSQL buffer manager locking requirements.
+	 * Keep this path single-pass (one buffer pin + one latch acquisition)
+	 * to reduce per-publish overhead in the common success case.
 	 */
 	buf = _bwt_getbuf(rel, map_blkno, BWT_WRITE);
 	page = BufferGetPage(buf);
 	entries = BWTreeMapPageGetEntries(page);
 	slot = _bwt_map_entry_atomic_slot(&entries[entry_idx]);
 
-	expected_packed = _bwt_map_pack_entry(expected_base_blkno,
-										  expected_delta_blkno);
-	desired_packed = _bwt_map_pack_entry(new_base_blkno, new_delta_blkno);
+	cur_packed = pg_atomic_read_u64(slot);
+	if (cur_packed != expected_packed)
+	{
+		_bwt_map_unpack_entry(cur_packed,
+							  observed_base_blkno,
+							  observed_delta_blkno);
+		_bwt_relbuf(rel, buf, BWT_WRITE);
+		return false;
+	}
+
+	if (desired_packed == expected_packed)
+	{
+		_bwt_relbuf(rel, buf, BWT_WRITE);
+		return true;
+	}
+
+	/*
+	 * Final publish under content lock. CAS still protects against races from
+	 * any concurrent writer that reached this point with matching expectation.
+	 */
 	ok = pg_atomic_compare_exchange_u64(slot, &expected_packed, desired_packed);
 	if (ok)
 		MarkBufferDirty(buf);
