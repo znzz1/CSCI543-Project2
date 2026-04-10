@@ -181,7 +181,7 @@ Delta and materialization core:
 
 - delta install with CAS retry
 - delta chain apply
-- node snapshot and materialization
+- node snapshot and materialization (dynamic tuple-vector path)
 - consolidation publish + retire old state
 
 ### `bwtreemap.c`
@@ -247,6 +247,12 @@ GC engine:
 3. Write new base page.
 4. CAS publish to `(new_base, InvalidDelta)`.
 5. Retire old chain/base for epoch-safe reclaim.
+
+Note:
+
+- Materialization is now built from base tuples plus delta replay into a
+  dynamic tuple vector (not a single `BLCKSZ` scratch page). This avoids
+  false overflow failures during heavy build windows before split publication.
 
 ### 5.4 Scan Path
 
@@ -345,12 +351,36 @@ These checks are intentional and prioritized over silent recovery.
 - Split retries can leave unreachable preallocated pages/PIDs in rare races
   (space/perf cost, not a logical read/write correctness violation).
 - GC and consolidation policies are conservative to reduce correctness risk.
-- Materialization was optimized to use one backing-page copy plus tuple
-  pointers (instead of per-tuple deep-copy), reducing scan/search allocation overhead.
+- Materialization now uses per-tuple copy into a dynamic vector for
+  correctness under large delta accumulation. This is safer but can increase
+  allocation and CPU overhead on scan/search hot paths.
 
 ---
 
-## 11. Extension Points for Future Work
+## 11. Recent Stability Fix (2026-04-10)
+
+Fixed a reproducible build-time failure:
+
+- Error: `bwtree: failed to apply INSERT delta to base page`
+- Typical trigger: `CREATE INDEX ... USING bwtree(k)` on large random data
+  during windows where a leaf's logical contents exceed single-page capacity
+  before split/consolidation catches up.
+
+Resolution:
+
+- Switched materialization to dynamic tuple-vector replay in
+  `src/backend/access/bwtree/bwtreedelta.c`.
+- This removes dependency on single-page `PageAddItem()` success during
+  materialization.
+
+Validation outcome:
+
+- Deterministic 100k dataset build case now succeeds:
+  `CREATE INDEX eval_bw_100k_k_idx ON eval_bw_100k USING bwtree(k);`
+
+---
+
+## 12. Extension Points for Future Work
 
 Potential next improvements:
 
@@ -362,7 +392,7 @@ Potential next improvements:
 
 ---
 
-## 12. Validation and Test Playbook
+## 13. Validation and Test Playbook
 
 Recommended progression:
 
@@ -370,6 +400,7 @@ Recommended progression:
    - clean build for module and backend.
 2. **Small correctness checks**
    - compare index-path vs seq-path outputs (eq/ge/gt/range diffs).
+   - include deterministic seed runs for reproducible bug regression checks.
 3. **Concurrent smoke tests**
    - mixed insert/update/read with multiple clients.
 4. **Scale tests**
@@ -387,7 +418,7 @@ Acceptance baseline for correctness:
 
 ---
 
-## 13. Performance Evaluation Quick Start (100k Baseline)
+## 14. Performance Evaluation Quick Start (100k Baseline)
 
 Recommended baseline for BwTree vs nbtree:
 
@@ -411,7 +442,7 @@ Important:
 
 ---
 
-## 14. Quick Navigation
+## 15. Quick Navigation
 
 - Public API/types: `src/include/access/bwtree.h`
 - AM callback wiring: `bwtree.c`

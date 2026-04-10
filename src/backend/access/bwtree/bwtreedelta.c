@@ -1,5 +1,7 @@
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "access/bwtree.h"
 #include "storage/indexfsm.h"
 #include "storage/bufpage.h"
@@ -107,25 +109,94 @@ _bwt_delete_tid_from_page(Page page, const ItemPointerData *target_tid)
 }
 
 static void
-_bwt_collect_page_items(Page page, BWTMaterializedPage *mpage)
+_bwt_materialized_reserve_items(BWTMaterializedPage *mpage, int *capacity, int needed)
 {
-	OffsetNumber	maxoff;
-	OffsetNumber	off;
-	int				capacity;
+	int	newcap;
 
-	maxoff = PageGetMaxOffsetNumber(page);
-	capacity = (int) maxoff;
-
-	if (capacity <= 0)
-	{
-		mpage->items = NULL;
-		mpage->nitems = 0;
+	if (mpage == NULL || capacity == NULL)
+		elog(ERROR, "bwtree: materialized reserve requires valid pointers");
+	if (needed <= *capacity)
 		return;
+
+	newcap = (*capacity > 0) ? *capacity : 16;
+	while (newcap < needed)
+	{
+		if (newcap > (INT_MAX / 2))
+			elog(ERROR, "bwtree: materialized item capacity overflow");
+		newcap *= 2;
 	}
 
-	mpage->items = (IndexTuple *) palloc0(sizeof(IndexTuple) * capacity);
-	mpage->nitems = 0;
+	if (mpage->items == NULL)
+		mpage->items = (IndexTuple *) palloc(sizeof(IndexTuple) * newcap);
+	else
+		mpage->items = (IndexTuple *) repalloc(mpage->items,
+											   sizeof(IndexTuple) * newcap);
+	*capacity = newcap;
+}
 
+static void
+_bwt_materialized_append_tuple_copy(BWTMaterializedPage *mpage,
+									int *capacity,
+									IndexTuple src)
+{
+	Size		sz;
+	IndexTuple	dst;
+
+	if (mpage == NULL || capacity == NULL)
+		elog(ERROR, "bwtree: materialized append requires valid pointers");
+	if (src == NULL)
+		return;
+
+	_bwt_materialized_reserve_items(mpage, capacity, mpage->nitems + 1);
+
+	sz = IndexTupleSize(src);
+	dst = (IndexTuple) palloc(sz);
+	memcpy(dst, src, sz);
+	mpage->items[mpage->nitems++] = dst;
+}
+
+static bool
+_bwt_materialized_delete_tid(BWTMaterializedPage *mpage,
+							 const ItemPointerData *target_tid)
+{
+	int				i;
+	ItemPointerData target_tid_local;
+
+	if (mpage == NULL || target_tid == NULL)
+		return false;
+
+	target_tid_local = *target_tid;
+	for (i = 0; i < mpage->nitems; i++)
+	{
+		IndexTuple itup = mpage->items[i];
+
+		if (itup == NULL)
+			continue;
+		if (ItemPointerEquals(&itup->t_tid, &target_tid_local))
+		{
+			pfree(itup);
+			if (i + 1 < mpage->nitems)
+				memmove(&mpage->items[i],
+						&mpage->items[i + 1],
+						sizeof(IndexTuple) * (mpage->nitems - i - 1));
+			mpage->nitems--;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void
+_bwt_collect_base_tuples(Page page, BWTMaterializedPage *mpage, int *capacity)
+{
+	OffsetNumber maxoff;
+	OffsetNumber off;
+
+	if (page == NULL || mpage == NULL || capacity == NULL)
+		elog(ERROR, "bwtree: base tuple collection requires valid inputs");
+
+	maxoff = PageGetMaxOffsetNumber(page);
 	for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 	{
 		ItemId		itemid;
@@ -136,7 +207,166 @@ _bwt_collect_page_items(Page page, BWTMaterializedPage *mpage)
 			continue;
 
 		itup = (IndexTuple) PageGetItem(page, itemid);
-		mpage->items[mpage->nitems++] = itup;
+		_bwt_materialized_append_tuple_copy(mpage, capacity, itup);
+	}
+}
+
+static void
+_bwt_apply_delta_chain_to_items(Relation rel,
+								BlockNumber delta_blkno,
+								BWTMaterializedPage *mpage,
+								int *capacity)
+{
+	BlockNumber				cur_blkno;
+	BlockNumber				rel_nblocks;
+	BlockNumber				hops = 0;
+	BlockNumber				hops_limit;
+	BWTreeDeltaApplyEntry   *entries = NULL;
+	int						nentries = 0;
+	int						entry_cap = 0;
+	int						i;
+
+	if (rel == NULL || mpage == NULL || capacity == NULL)
+		elog(ERROR, "bwtree: delta-chain apply requires valid inputs");
+
+	cur_blkno = delta_blkno;
+	rel_nblocks = RelationGetNumberOfBlocks(rel);
+	hops_limit = rel_nblocks + 1;
+
+	while (BlockNumberIsValid(cur_blkno))
+	{
+		Buffer					buf;
+		Page					page;
+		BWTreePageOpaque		opaque;
+		OffsetNumber			page_maxoff;
+		ItemId					itemid;
+		BWTreeDeltaRecordData  *drec;
+		Size					rec_size;
+
+		if (cur_blkno >= rel_nblocks)
+			elog(ERROR, "bwtree: delta chain points outside relation (blk=%u nblocks=%u)",
+				 (unsigned int) cur_blkno,
+				 (unsigned int) rel_nblocks);
+
+		buf = _bwt_getbuf(rel, cur_blkno, BWT_READ);
+		page = BufferGetPage(buf);
+		opaque = BWTreePageGetOpaque(page);
+		if (opaque->bwto_page_id != BWTREE_PAGE_ID || !BWTreePageIsDelta(opaque))
+		{
+			_bwt_relbuf(rel, buf, BWT_READ);
+			elog(ERROR, "bwtree: block %u is not a valid delta page",
+				 (unsigned int) cur_blkno);
+		}
+
+		page_maxoff = PageGetMaxOffsetNumber(page);
+		if (page_maxoff < FirstOffsetNumber)
+		{
+			_bwt_relbuf(rel, buf, BWT_READ);
+			elog(ERROR, "bwtree: delta page %u contains no records",
+				 (unsigned int) cur_blkno);
+		}
+
+		itemid = PageGetItemId(page, FirstOffsetNumber);
+		if (!ItemIdIsUsed(itemid))
+		{
+			_bwt_relbuf(rel, buf, BWT_READ);
+			elog(ERROR, "bwtree: delta page %u has invalid first item",
+				 (unsigned int) cur_blkno);
+		}
+
+		drec = (BWTreeDeltaRecordData *) PageGetItem(page, itemid);
+		rec_size = BWTreeDeltaRecordSize(drec);
+
+		if (nentries == entry_cap)
+		{
+			entry_cap = (entry_cap == 0) ? 8 : entry_cap * 2;
+			if (entries == NULL)
+				entries = (BWTreeDeltaApplyEntry *)
+					palloc(entry_cap * sizeof(BWTreeDeltaApplyEntry));
+			else
+				entries = (BWTreeDeltaApplyEntry *)
+					repalloc(entries, entry_cap * sizeof(BWTreeDeltaApplyEntry));
+		}
+
+		entries[nentries].drec = (BWTreeDeltaRecordData *) palloc(rec_size);
+		memcpy(entries[nentries].drec, drec, rec_size);
+		nentries++;
+
+		cur_blkno = opaque->bwto_next;
+		_bwt_relbuf(rel, buf, BWT_READ);
+		hops++;
+		if (hops > hops_limit)
+			elog(ERROR, "bwtree: delta-chain apply exceeded safety bound (possible cycle)");
+	}
+
+	for (i = nentries - 1; i >= 0; i--)
+	{
+		BWTreeDeltaRecordData *drec = entries[i].drec;
+
+		switch (drec->type)
+		{
+			case BW_DELTA_INSERT:
+			{
+				IndexTuple itup = BWTreeDeltaRecordGetTuple(drec);
+
+				if (itup != NULL)
+					_bwt_materialized_append_tuple_copy(mpage, capacity, itup);
+				break;
+			}
+			case BW_DELTA_DELETE:
+			{
+				if (ItemPointerIsValid(&drec->target_tid))
+					(void) _bwt_materialized_delete_tid(mpage, &drec->target_tid);
+				break;
+			}
+			case BW_DELTA_SPLIT:
+			case BW_DELTA_SEPARATOR:
+				break;
+		}
+	}
+
+	for (i = 0; i < nentries; i++)
+		pfree(entries[i].drec);
+	if (entries != NULL)
+		pfree(entries);
+}
+
+static void
+_bwt_materialized_build_from_base_and_delta(Relation rel,
+											Page basepage,
+											const BWTreeNodeSnapshot *snapshot,
+											BWTMaterializedPage *mpage)
+{
+	int					capacity = 0;
+	BWTreePageOpaque	base_opaque;
+
+	if (rel == NULL || basepage == NULL || snapshot == NULL || mpage == NULL)
+		elog(ERROR, "bwtree: materialized build requires valid inputs");
+
+	mpage->items = NULL;
+	mpage->nitems = 0;
+	mpage->backing_page = NULL;
+
+	base_opaque = BWTreePageGetOpaque(basepage);
+	mpage->base_blkno = snapshot->base_blkno;
+	mpage->prev_blkno = base_opaque->bwto_prev;
+	mpage->next_blkno = base_opaque->bwto_next;
+	mpage->flags = base_opaque->bwto_flags;
+	mpage->level = base_opaque->bwto_level;
+
+	_bwt_collect_base_tuples(basepage, mpage, &capacity);
+
+	if (BlockNumberIsValid(snapshot->delta_blkno))
+	{
+		/*
+		 * Correctness-first fix:
+		 *
+		 * Apply deltas into a dynamic tuple vector instead of a single BLCKSZ
+		 * scratch page. This avoids false overflow errors during build/split
+		 * materialization when logical tuple count temporarily exceeds one-page
+		 * physical capacity prior to split publication.
+		 */
+		_bwt_apply_delta_chain_to_items(rel, snapshot->delta_blkno, mpage, &capacity);
 	}
 }
 
@@ -147,32 +377,10 @@ _bwt_materialize_from_snapshot(Relation rel,
 {
 	Buffer				basebuf;
 	Page				basepage;
-	Page				workpage;
-	BWTreePageOpaque	work_opaque;
 
 	basebuf = _bwt_getbuf(rel, snapshot->base_blkno, BWT_READ);
 	basepage = BufferGetPage(basebuf);
-	/*
-	 * Correctness-first trade-off:
-	 *
-	 * Always materialize on a private page copy. We never mutate the shared
-	 * base buffer page directly in this stage.
-	 */
-	workpage = (Page) palloc(BLCKSZ);
-	memcpy(workpage, basepage, BLCKSZ);
-
-	if (BlockNumberIsValid(snapshot->delta_blkno))
-		_bwt_delta_apply(rel, snapshot->delta_blkno, workpage, NULL);
-
-	mpage->backing_page = workpage;
-	work_opaque = BWTreePageGetOpaque(workpage);
-	mpage->base_blkno = snapshot->base_blkno;
-	mpage->prev_blkno = work_opaque->bwto_prev;
-	mpage->next_blkno = work_opaque->bwto_next;
-	mpage->flags = work_opaque->bwto_flags;
-	mpage->level = work_opaque->bwto_level;
-
-	_bwt_collect_page_items(workpage, mpage);
+	_bwt_materialized_build_from_base_and_delta(rel, basepage, snapshot, mpage);
 	_bwt_relbuf(rel, basebuf, BWT_READ);
 }
 
@@ -591,11 +799,20 @@ _bwt_materialize_page(Relation rel, BWTreeMetaPageData *metad,
 void
 _bwt_free_materialized_page(BWTMaterializedPage *mpage)
 {
+	int i;
+
 	if (mpage == NULL)
 		return;
 
 	if (mpage->items != NULL)
+	{
+		for (i = 0; i < mpage->nitems; i++)
+		{
+			if (mpage->items[i] != NULL)
+				pfree(mpage->items[i]);
+		}
 		pfree(mpage->items);
+	}
 	if (mpage->backing_page != NULL)
 		pfree(mpage->backing_page);
 
