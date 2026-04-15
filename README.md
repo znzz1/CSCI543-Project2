@@ -1,458 +1,255 @@
-# BwTree Access Method: Detailed Architecture and Developer Guide
+# BwTree Project 2
 
-This directory implements a PostgreSQL index access method named `bwtree`
-(`USING bwtree`).
+PostgreSQL index access method implementation (`USING bwtree`) with reproducible evaluation scripts.
 
-The code is currently **correctness-first**. In several places it intentionally
-uses conservative synchronization and retry logic to preserve semantics under
-concurrency before optimizing for peak throughput.
+This project is **correctness-first**: semantics and reproducibility are prioritized before throughput tuning.
 
 ---
 
-## 0. Version and Compatibility Notice
+## 0. Container Setup and Folder Layout
 
-- Current on-disk metadata version is `BWTREE_VERSION = 2`.
-- Mapping-table density/layout was changed to spread hot PIDs across more
-  mapping pages.
-- Rebuild BwTree indexes after upgrading to this version; old on-disk layouts
-  are not intended to be reused across this change.
+### 0.1 Dev Container baseline
 
----
+This project was developed and tested in a VS Code Dev Container with:
 
-## 1. What This Module Is Responsible For
+- Base image: `mcr.microsoft.com/devcontainers/base:noble`
+- OS: Ubuntu 24.04 (Noble)
+- Shell: Bash
 
-### In Scope (Implemented)
+### 0.2 Workspace layout used in our environment
 
-- AM callback wiring (`CREATE INDEX`, insert, scan, bitmap scan, vacuum hooks).
-- PID-based mapping table (`PID -> (base block, delta head block)`).
-- Delta-chain updates for logical mutations.
-- Leaf and internal split with parent propagation.
-- Consolidation of base + delta chains.
-- Epoch-based deferred reclamation and GC queues.
-- SQL-visible correctness for non-unique indexing scenarios.
+In our container workspace, the directory layout is:
 
-### Out of Scope / Not Fully Implemented Yet
+```text
+<workspace-root>/
+|- .devcontainer/
+`- CSCI543-Project2/     <-- actual Git repository root
+```
 
-- Full `UNIQUE` index semantics.
-- Full SQL delete/vacuum pruning parity with PostgreSQL nbtree.
-- Full paper-level lock-free optimization profile.
-- Production-level delete/vacuum integration parity.
-- Ordered scan features (`ORDER BY` / backward scan / orderby-op scans).
-- Scan-key extensions such as row-comparison and array-search scan keys.
+Important: run build/evaluation commands **inside** `CSCI543-Project2/`.
 
-Current behavior behind those gaps:
-
-- `bwtreeinsert()` rejects non-`UNIQUE_CHECK_NO` inserts.
-- `bwtreebulkdelete()` / `bwtreevacuumcleanup()` run maintenance bookkeeping
-  only; dead-index-tuple pruning callback flow is not implemented yet.
+If you cloned directly without an outer wrapper, your current folder is already the repository root.
 
 ---
 
-## 2. Conceptual Model
+## Quick Start
 
-### 2.1 PID and Mapping Table
+From your current terminal:
 
-- A **PID** is a stable logical node id.
-- Physical pages can move/rewrite, but PID identity remains stable.
-- The mapping table stores the current physical state for each PID:
-  - `base_blkno`: current base page for this PID.
-  - `delta_blkno`: current delta chain head (or invalid if none).
+```bash
+# If this folder contains CSCI543-Project2/ but no configure file, enter repo root
+if [ -d CSCI543-Project2 ] && [ ! -f configure ]; then
+  cd CSCI543-Project2
+fi
 
-### 2.2 Base Page + Delta Chain
+./configure --prefix="$PWD/install"
+make -j8
+make install
 
-- Base page stores materialized tuples for a node.
-- Delta pages prepend logical changes (insert/delete/control deltas).
-- Logical node state = `base page` + `apply(delta chain from head to tail)`.
+"$PWD/install/bin/initdb" -D "$PWD/db"
+"$PWD/install/bin/pg_ctl" -D "$PWD/db" -l "$PWD/pg.log" start
 
-### 2.3 Structural Modification (SMO)
+bash scripts/setup/setup_eval.sh --pg-bin "$PWD/install/bin" --db evaldb --rows 100000
+bash scripts/bench/run_pgbench_eval.sh --pg-bin "$PWD/install/bin" --db evaldb --duration 60
+bash scripts/bench/run_correctness_check.sh --pg-bin "$PWD/install/bin" --db evaldb
 
-- Splits create new right node(s), publish mapping transitions via CAS,
-  and propagate separators upward.
-- Root split installs a new root PID.
-
-### 2.4 Deferred Reclamation
-
-- Old chains/pages are retired, not immediately freed.
-- Epoch rules decide when retired objects become reclaimable.
+python3 scripts/analysis/parse_pgbench.py --raw-dir results/raw --out results/summary/pgbench_summary.csv
+python3 scripts/plots/plot_results.py --input results/summary/pgbench_summary.csv --out-dir results/figures
+```
 
 ---
 
-## 3. Key Data Structures (Defined in `src/include/access/bwtree.h`)
+## 1. Reproduce Step by Step
 
-### `BWTreeMetaPageData`
+### 1.0 Enter repository root
 
-Global index metadata on metapage:
+If you are in an outer workspace wrapper, run:
 
-- magic/version,
-- `bwt_root_pid`,
-- current tree level,
-- PID allocator cursor (`bwt_next_pid`),
-- mapping-page block number array.
+```bash
+cd CSCI543-Project2
+```
 
-### `BWTreeMapEntry`
+If `configure` already exists in current folder, skip this step.
 
-A mapping-table slot:
+### 1.1 Build
 
-- `base_blkno`,
-- `delta_blkno`.
+```bash
+./configure --prefix="$PWD/install"
+make -j8
+make install
+```
 
-### `BWTreePageOpaqueData`
+### 1.2 Initialize PostgreSQL (first run only)
 
-Per-page opaque metadata:
+```bash
+"$PWD/install/bin/initdb" -D "$PWD/db"
+"$PWD/install/bin/pg_ctl" -D "$PWD/db" -l "$PWD/pg.log" start
+```
 
-- sibling pointers (`prev`, `next`),
-- owning PID,
-- level,
-- flags (`LEAF`, `ROOT`, `DELTA`, etc.),
-- page id signature.
+### 1.3 Prepare dataset and indexes
 
-### `BWTreeDeltaRecordData`
+```bash
+bash scripts/setup/setup_eval.sh --pg-bin "$PWD/install/bin" --db evaldb --rows 100000
+```
 
-Logical delta payload header:
+### 1.4 Run benchmark matrix
 
-- type (`INSERT`, `DELETE`, `SPLIT`, `SEPARATOR`),
-- related PID (for control records),
-- target TID (for delete-style semantics),
-- trailing tuple payload length.
+```bash
+bash scripts/bench/run_pgbench_eval.sh --pg-bin "$PWD/install/bin" --db evaldb --duration 60
+```
 
-### Snapshot / View Structures
+### 1.5 Run correctness validation
 
-- `BWTreeNodeSnapshot`: stable `(pid, base, delta, level, flags)` capture.
-- `BWTMaterializedPage`: logical tuple array + sibling metadata.
-- `BWTreeNodeView`: snapshot + materialized page + split metadata for routing.
+```bash
+bash scripts/bench/run_correctness_check.sh --pg-bin "$PWD/install/bin" --db evaldb
+```
 
----
+### 1.6 Parse logs and plot figures
 
-## 4. File-by-File Responsibility Map
-
-### `bwtree.c`
-
-Top-level AM API entrypoints and handler registration:
-
-- `bwtreehandler`
-- build/insert/scan/vacuum/cost callback glue
-
-### `bwtreesort.c`
-
-Build path and initial on-disk layout creation:
-
-- empty tree bootstrap
-- mapping page initialization during build
-- initial root/base creation and tuple loading
-
-### `bwtreeinsert.c`
-
-Insert entrypoint:
-
-- construct route `ScanKey`
-- descend to leaf (+ parent hint)
-- delegate to `_bwt_insert_item`
-- trigger periodic GC scheduling
-
-### `bwtreesearch.c`
-
-Routing logic:
-
-- root-to-leaf descent
-- internal child selection via key comparison
-- split move-right handling
-- parent path tracking
-
-### `bwtreescan.c`
-
-Scan lifecycle:
-
-- begin/rescan/end
-- tuple and bitmap retrieval
-- key filtering and leaf traversal safety checks
-
-### `bwtreesmo.c`
-
-SMO logic:
-
-- split detection and execution
-- internal-page insert/rewrite
-- root install
-- parent resolution and upward split propagation
-
-### `bwtreedelta.c`
-
-Delta and materialization core:
-
-- delta install with CAS retry
-- delta chain apply
-- node snapshot and materialization (dynamic tuple-vector path)
-- consolidation publish + retire old state
-
-### `bwtreemap.c`
-
-Mapping table primitives:
-
-- lookup
-- CAS publish transition
-- PID allocation
-- map page growth
-
-### `bwtreepage.c`
-
-Buffer/page helpers:
-
-- `_bwt_getbuf`, `_bwt_relbuf`, `_bwt_allocbuf`
-- page initialization (`_bwt_initpage`, `_bwt_initmetapage`)
-
-### `bwtreeepoch.c`
-
-Epoch manager:
-
-- shared/global epoch state
-- backend local participation state
-- min-active epoch and advance logic
-
-### `bwtreegc.c`
-
-GC engine:
-
-- retire object enqueue
-- local/shared queue coordination
-- reclaim execution under epoch-safe conditions
+```bash
+python3 scripts/analysis/parse_pgbench.py --raw-dir results/raw --out results/summary/pgbench_summary.csv
+python3 scripts/plots/plot_results.py --input results/summary/pgbench_summary.csv --out-dir results/figures
+```
 
 ---
 
-## 5. End-to-End Call Chains
+## 2. Output Artifacts
 
-### 5.1 Insert Path
-
-1. `bwtreeinsert` enters epoch and builds route key.
-2. `_bwt_search_leaf_with_parent` returns target leaf PID (+ parent hint).
-3. `_bwt_insert_item` installs insert delta.
-4. Periodic split/consolidation checks run.
-5. Publish state changes through `_bwt_map_cas`.
-6. Retire old objects for epoch GC.
-
-### 5.2 Leaf/Internal Split Path
-
-1. Snapshot capture (`base`, `delta_head`, metadata).
-2. Materialize logical contents.
-3. Build left/right outputs and allocate right PID/page.
-4. Publish map transition via CAS.
-5. Install split/separator control deltas.
-6. Propagate separator upward:
-   - internal insert or recursive internal split,
-   - or install new root.
-
-### 5.3 Consolidation Path
-
-1. Snapshot capture.
-2. Materialize base + delta.
-3. Write new base page.
-4. CAS publish to `(new_base, InvalidDelta)`.
-5. Retire old chain/base for epoch-safe reclaim.
-
-Note:
-
-- Materialization is now built from base tuples plus delta replay into a
-  dynamic tuple vector (not a single `BLCKSZ` scratch page). This avoids
-  false overflow failures during heavy build windows before split publication.
-
-### 5.4 Scan Path
-
-1. Start from routed leaf.
-2. Materialize logical leaf state.
-3. Filter tuples by scan keys.
-4. Follow sibling links for range continuation.
+- Raw logs: `results/raw/*.log`
+- Key summaries: `results/summary/*`
+- Figures: `results/figures/*.png`
 
 ---
 
-## 6. Concurrency and Locking Strategy (Current)
+## 3. Evaluation Configuration (Proposal-Aligned)
 
-### 6.1 Buffer Locks
-
-- Page content mutations occur under PostgreSQL buffer content locks.
-- Dirty marking follows lock discipline expected by buffer manager.
-
-### 6.2 CAS Publish
-
-- Mapping transitions use atomic CAS on packed map entries.
-- CAS publish uses a single-pass write-latched path so successful updates can
-  call `MarkBufferDirty()` under PostgreSQL buffer-manager lock rules.
-- Writers retry on stale expected state.
-- Retry outcomes are interpreted carefully:
-  - idempotent already-published state is accepted,
-  - incompatible observed state forces restart from fresh snapshot.
-
-### 6.3 Revalidation Before Publish
-
-Critical paths re-check mapping state before final publish:
-
-- split,
-- internal rewrite,
-- consolidation.
-
-This prevents stale-snapshot publication races.
+- Compared engines:
+  - BwTree (`USING bwtree`)
+  - PostgreSQL nbtree (`USING btree`)
+- Workloads:
+  - Insert-only
+  - Read-Modify-Write
+- Concurrency:
+  - `1, 8, 16, 32, 64`
+- Metrics:
+  - TPS
+  - Average latency (ms)
+  - Scalability vs client count
 
 ---
 
-## 7. Epoch and GC Design
+## 4. Scripts Overview
 
-### 7.1 Epoch Participation
+- `scripts/setup/setup_eval.sh`
+  - Build evaluation tables, load synthetic data, create BwTree + B-tree indexes.
+- `scripts/bench/run_pgbench_eval.sh`
+  - Run full benchmark matrix and collect raw logs.
+- `scripts/bench/run_correctness_check.sh`
+  - SQL diff checks (`diff_eq/diff_ge/diff_gt/diff_rng`).
+- `scripts/bench/*.sql`
+  - `pgbench` transaction scripts (`insert`, `rmw`) for both engines.
+- `scripts/analysis/parse_pgbench.py`
+  - Parse `pgbench` logs into structured CSV.
+- `scripts/plots/plot_results.py`
+  - Plot TPS and latency curves from CSV.
 
-- Each backend tracks local epoch participation and nesting depth.
-- Shared state tracks global epoch and active backend epochs.
-
-### 7.2 Retirement
-
-- Mutations retire objects (delta chains / blocks) with a retire epoch.
-- Retired objects are queued locally and can spill/share.
-
-### 7.3 Reclamation Rule
-
-- Object is reclaimable when `retire_epoch < min_active_epoch`.
-
-### 7.4 Queue Model
-
-- Backend-local queue: low-overhead local retirement.
-- Shared queue: cross-backend spill/recovery path.
-
----
-
-## 8. Correctness Invariants
-
-The following invariants should always hold:
-
-1. Every live PID maps to a valid base block.
-2. Mapping CAS transitions are from observed expected state only.
-3. Split/consolidation publication is based on a validated fresh snapshot.
-4. Delta chain walks stay in relation bounds and remain acyclic.
-5. Search descent preserves key-order routing rules.
-6. Reclamation never frees objects still visible to active epochs.
-7. Parent/child level relationship is consistent in internal routing.
+All shell scripts accept `--pg-bin <path-to-bin>`. If omitted, they auto-detect from:
+1. `<repo-root>/bin`
+2. `psql/pgbench` in `PATH`
+3. `<repo-root>/postgresql/bin` (legacy layout)
 
 ---
 
-## 9. Defensive Checks and Fail-Fast Behavior
+## 5. Implementation Overview
 
-Code includes explicit fail-fast guards for:
+### 5.1 Core Design
 
-- invalid page signatures,
-- out-of-range block references,
-- malformed delta chains,
-- invalid downlinks,
-- impossible routing levels,
-- retry-bound overflow.
+- Stable logical node identity via `PID`.
+- Mapping table stores `PID -> (base_blkno, delta_blkno)`.
+- Logical updates are represented as delta records and published through map CAS.
+- Split and consolidation reshape nodes.
+- Epoch + GC provide deferred-safe reclamation.
 
-These checks are intentional and prioritized over silent recovery.
+### 5.2 Main Execution Paths
 
----
+- Insert:
+  - search leaf -> install insert delta -> split/consolidate checks -> retire old state
+- Split:
+  - snapshot -> materialize -> build left/right -> publish -> separator propagation
+- Consolidation:
+  - rebuild from base + delta chain -> CAS publish new base -> retire old chain/base
+- Scan:
+  - route leaf -> materialize logical view -> apply predicates -> sibling traversal
 
-## 10. Current Trade-offs
+### 5.3 Recent Correctness Hardening
 
-- Some operations are serialized more than ideal (correctness first).
-- Mapping-page write latches are still a major contention source at high client counts.
-- Split retries can leave unreachable preallocated pages/PIDs in rare races
-  (space/perf cost, not a logical read/write correctness violation).
-- GC and consolidation policies are conservative to reduce correctness risk.
-- Materialization now uses per-tuple copy into a dynamic vector for
-  correctness under large delta accumulation. This is safer but can increase
-  allocation and CPU overhead on scan/search hot paths.
-
----
-
-## 11. Recent Stability Fix (2026-04-10)
-
-Fixed a reproducible build-time failure:
-
-- Error: `bwtree: failed to apply INSERT delta to base page`
-- Typical trigger: `CREATE INDEX ... USING bwtree(k)` on large random data
-  during windows where a leaf's logical contents exceed single-page capacity
-  before split/consolidation catches up.
-
-Resolution:
-
-- Switched materialization to dynamic tuple-vector replay in
-  `src/backend/access/bwtree/bwtreedelta.c`.
-- This removes dependency on single-page `PageAddItem()` success during
-  materialization.
-
-Validation outcome:
-
-- Deterministic 100k dataset build case now succeeds:
-  `CREATE INDEX eval_bw_100k_k_idx ON eval_bw_100k USING bwtree(k);`
+- Materialization now replays base + delta into a **dynamic tuple vector** instead of a single `BLCKSZ` scratch page.
+- This fixes a previously reproducible failure during heavy index build:
+  - `bwtree: failed to apply INSERT delta to base page`
 
 ---
 
-## 12. Extension Points for Future Work
+## 6. Scope and Current Limitations
 
-Potential next improvements:
+Implemented in this stage:
 
-- optimize high-contention map update paths,
-- improve parent resolution cost in split propagation,
-- implement full unique semantics,
-- refine consolidation scheduling heuristics,
-- tune epoch/GC triggering strategies for lower write latency.
+- Core AM callbacks (build/insert/scan/bitmap/vacuum wiring)
+- Mapping CAS path
+- Delta install/apply/materialization
+- Leaf + internal split propagation
+- Consolidation
+- Epoch-based deferred GC
 
----
+Not fully implemented in this stage:
 
-## 13. Validation and Test Playbook
+- Full `UNIQUE` semantics
+- Full delete/vacuum parity with nbtree
+- Ordered index-scan feature parity (`ORDER BY`, backward ordered scans)
+- Full paper-level lock-free optimization profile
 
-Recommended progression:
+Behavior note:
 
-1. **Compile check**
-   - clean build for module and backend.
-2. **Small correctness checks**
-   - compare index-path vs seq-path outputs (eq/ge/gt/range diffs).
-   - include deterministic seed runs for reproducible bug regression checks.
-3. **Concurrent smoke tests**
-   - mixed insert/update/read with multiple clients.
-4. **Scale tests**
-   - increase rows and clients progressively (1, 8, 16, 32, 64).
-5. **Observe**
-   - transaction aborts,
-   - warnings/errors,
-   - correctness diffs,
-   - throughput collapse points.
-
-Acceptance baseline for correctness:
-
-- no unexpected ERROR/aborts under smoke load,
-- result diffs remain zero for core predicates.
+- `bwtreeinsert()` rejects non-`UNIQUE_CHECK_NO` requests.
 
 ---
 
-## 14. Performance Evaluation Quick Start (100k Baseline)
+## 7. Code Map
 
-Recommended baseline for BwTree vs nbtree:
-
-- Workloads: `Insert-only` and `Read-Modify-Write`.
-- Initial rows: `100,000`.
-- Concurrency points: `1, 8, 16, 32, 64`.
-- Metrics: `latency average`, `TPS`, and `ERROR/WARNING/aborted` logs.
-
-Minimal workflow:
-
-1. Create a fresh database and load identical data into two tables.
-2. Build `USING bwtree` on one table and `USING btree` on the other.
-3. Run `pgbench -M prepared` for each workload/client-count pair.
-4. Collect per-run logs and extract latency/TPS summary lines.
-5. Always grep logs for warnings/errors before trusting throughput numbers.
-
-Important:
-
-- Recreate indexes after structural/version changes (especially mapping layout
-  updates), otherwise performance and correctness comparisons may be invalid.
+| File | Responsibility |
+|---|---|
+| `src/include/access/bwtree.h` | Core types/constants/public internal declarations |
+| `src/backend/access/bwtree/bwtree.c` | AM handler + callback registration |
+| `src/backend/access/bwtree/bwtreesort.c` | Build path/bootstrap |
+| `src/backend/access/bwtree/bwtreeinsert.c` | Insert entry + routing setup |
+| `src/backend/access/bwtree/bwtreesearch.c` | Root-to-leaf routing |
+| `src/backend/access/bwtree/bwtreescan.c` | Scan lifecycle |
+| `src/backend/access/bwtree/bwtreesmo.c` | Split/root/internal SMO logic |
+| `src/backend/access/bwtree/bwtreedelta.c` | Delta install/apply/materialize/consolidate |
+| `src/backend/access/bwtree/bwtreemap.c` | Mapping lookup/update/CAS/PID allocation |
+| `src/backend/access/bwtree/bwtreeepoch.c` | Epoch state/advance |
+| `src/backend/access/bwtree/bwtreegc.c` | Retire queue + reclaim |
+| `src/backend/access/bwtree/bwtreepage.c` | Buffer/page helpers |
 
 ---
 
-## 15. Quick Navigation
+## 8. Troubleshooting
 
-- Public API/types: `src/include/access/bwtree.h`
-- AM callback wiring: `bwtree.c`
-- Build path: `bwtreesort.c`
-- Insert entry: `bwtreeinsert.c`
-- Search route: `bwtreesearch.c`
-- Scan path: `bwtreescan.c`
-- SMO (split/root/internal): `bwtreesmo.c`
-- Delta/consolidation: `bwtreedelta.c`
-- Mapping CAS: `bwtreemap.c`
-- Buffer/page helpers: `bwtreepage.c`
-- Epoch manager: `bwtreeepoch.c`
-- GC engine: `bwtreegc.c`
+- Index build seems slow:
+  - check `pg_stat_activity` and wait events
+  - `DataFileRead` usually means IO-bound (not deadlock)
+- Benchmark aborts:
+  - inspect `results/raw/*.log` and `<repo-root>/pg.log`
+- Correctness diff not zero:
+  - rerun `scripts/bench/run_correctness_check.sh`
+  - confirm the correct target DB/table is used
+
+---
+
+## 9. Submission Checklist
+
+- BwTree implementation code
+- Setup + benchmark scripts
+- Correctness validation script
+- Analysis/parsing script
+- Plot generation script
+- This root `README.md` with complete reproduction steps
