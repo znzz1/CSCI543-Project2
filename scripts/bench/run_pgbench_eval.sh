@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PG_BIN="${PG_BIN:-${ROOT_DIR}/bin}"
+PG_BIN="${PG_BIN:-${ROOT_DIR}/install/bin}"
 DB_NAME="evaldb"
 DURATION="60"
 CLIENTS_STR="1 8 16 32 64"
@@ -51,7 +51,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -x "${PG_BIN}/pgbench" ]]; then
-  if command -v pgbench >/dev/null 2>&1; then
+  if [[ -x "${ROOT_DIR}/install/bin/pgbench" ]]; then
+    PG_BIN="${ROOT_DIR}/install/bin"
+  elif [[ -x "${ROOT_DIR}/bin/pgbench" ]]; then
+    PG_BIN="${ROOT_DIR}/bin"
+  elif command -v pgbench >/dev/null 2>&1; then
     PG_BIN="$(cd "$(dirname "$(command -v pgbench)")" && pwd)"
   elif [[ -x "${ROOT_DIR}/postgresql/bin/pgbench" ]]; then
     PG_BIN="${ROOT_DIR}/postgresql/bin"

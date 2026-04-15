@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PG_BIN="${PG_BIN:-${ROOT_DIR}/bin}"
+PG_BIN="${PG_BIN:-${ROOT_DIR}/install/bin}"
 DB_NAME="evaldb"
 ROWS="100000"
 KEY_MAX="1000000"
@@ -43,7 +43,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -x "${PG_BIN}/psql" ]]; then
-  if command -v psql >/dev/null 2>&1; then
+  if [[ -x "${ROOT_DIR}/install/bin/psql" ]]; then
+    PG_BIN="${ROOT_DIR}/install/bin"
+  elif [[ -x "${ROOT_DIR}/bin/psql" ]]; then
+    PG_BIN="${ROOT_DIR}/bin"
+  elif command -v psql >/dev/null 2>&1; then
     PG_BIN="$(cd "$(dirname "$(command -v psql)")" && pwd)"
   elif [[ -x "${ROOT_DIR}/postgresql/bin/psql" ]]; then
     PG_BIN="${ROOT_DIR}/postgresql/bin"
